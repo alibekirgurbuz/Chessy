@@ -56,6 +56,7 @@ const handleUserCreated = async (payload) => {
       firstName: first_name || '',
       lastName: last_name || '',
       imageUrl: image_url || '',
+      emailVerified: true, // Clerk'ten geliyorsa doğrulanmış varsayıyoruz
     });
 
     console.log('User created successfully:', user._id);
@@ -70,7 +71,7 @@ const handleUserCreated = async (payload) => {
         return { success: true, user: existingUser, alreadyExists: true };
       }
     }
-    
+
     console.error('Error creating user:', error);
     console.error('Error details:', {
       message: error.message,
@@ -114,7 +115,9 @@ const handleUserDeleted = async (payload) => {
   try {
     const { id } = payload.data;
 
+    console.log('🗑️ [Webhook] Processing user deletion for clerkId:', id);
     const user = await User.findOneAndDelete({ clerkId: id });
+    console.log('🗑️ [Webhook] DB Delete result:', user ? 'Success' : 'User not found');
 
     if (!user) {
       throw new Error('User not found');
