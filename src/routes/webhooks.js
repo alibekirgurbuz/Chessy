@@ -9,101 +9,85 @@ const {
 const router = express.Router();
 
 router.post('/clerk', async (req, res) => {
+  const WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
+
+  if (!WEBHOOK_SECRET) {
+    console.error('CLERK_WEBHOOK_SECRET is not set');
+    return res.status(500).json({ error: 'Webhook secret not configured' });
+  }
+
+  // Get headers
+  const svix_id = req.headers['svix-id'];
+  const svix_timestamp = req.headers['svix-timestamp'];
+  const svix_signature = req.headers['svix-signature'];
+
+  // If there are no headers, error out
+  if (!svix_id || !svix_timestamp || !svix_signature) {
+    console.error('Missing svix headers');
+    return res.status(400).json({ error: 'Missing svix headers' });
+  }
+
+  // Get the raw body
+  let payload = req.body;
+  if (Buffer.isBuffer(payload)) {
+    payload = payload.toString('utf8');
+  } else if (typeof payload !== 'string') {
+    payload = JSON.stringify(payload);
+  }
+
+  const wh = new Webhook(WEBHOOK_SECRET);
+  let evt;
+
   try {
-    console.log('Webhook received - Body type:', typeof req.body);
-    console.log('Webhook received - Headers:', {
-      'svix-id': req.headers['svix-id'] ? 'present' : 'missing',
-      'svix-timestamp': req.headers['svix-timestamp'] ? 'present' : 'missing',
-      'svix-signature': req.headers['svix-signature'] ? 'present' : 'missing',
+    evt = wh.verify(payload, {
+      'svix-id': svix_id,
+      'svix-timestamp': svix_timestamp,
+      'svix-signature': svix_signature,
     });
+    console.log('Webhook verified successfully');
+  } catch (err) {
+    console.error('Webhook verification failed:', err.message);
+    return res.status(400).json({ 
+      error: 'Webhook verification failed', 
+      details: err.message 
+    });
+  }
 
-    const webhookSecret = process.env.CLERK_WEBHOOK_SECRET;
+  const { type, data } = evt;
+  console.log(`Received webhook event: ${type}`);
 
-    if (!webhookSecret) {
-      console.error('CLERK_WEBHOOK_SECRET is not set');
-      return res.status(500).json({ error: 'Webhook secret not configured' });
+  try {
+    switch (type) {
+      case 'user.created':
+        console.log(`Processing user.created for ${data.id}`);
+        await handleUserCreated(evt);
+        console.log('User created successfully:', data.id);
+        break;
+      
+      case 'user.updated':
+        console.log(`Processing user.updated for ${data.id}`);
+        await handleUserUpdated(evt);
+        console.log('User updated successfully:', data.id);
+        break;
+      
+      case 'user.deleted':
+        console.log(`Processing user.deleted for ${data.id}`);
+        await handleUserDeleted(evt);
+        console.log('User deleted successfully:', data.id);
+        break;
+      
+      default:
+        console.log('Unhandled webhook event type:', type);
     }
 
-    // Get headers
-    const svixId = req.headers['svix-id'];
-    const svixTimestamp = req.headers['svix-timestamp'];
-    const svixSignature = req.headers['svix-signature'];
+    // Success response
+    return res.status(200).json({ success: true });
 
-    if (!svixId || !svixTimestamp || !svixSignature) {
-      console.error('Missing svix headers:', { 
-        svixId: !!svixId, 
-        svixTimestamp: !!svixTimestamp, 
-        svixSignature: !!svixSignature 
-      });
-      return res.status(400).json({ error: 'Missing svix headers' });
-    }
-
-    // Get the raw body (Buffer'dan string'e çevir veya direkt string)
-    let payload;
-    if (Buffer.isBuffer(req.body)) {
-      payload = req.body.toString('utf8');
-    } else if (typeof req.body === 'string') {
-      payload = req.body;
-    } else {
-      payload = JSON.stringify(req.body);
-    }
-
-    console.log('Payload length:', payload.length);
-
-    // Create a new Svix instance with the webhook secret
-    const wh = new Webhook(webhookSecret);
-
-    let evt;
-
-    try {
-      // Verify the webhook
-      evt = wh.verify(payload, {
-        'svix-id': svixId,
-        'svix-timestamp': svixTimestamp,
-        'svix-signature': svixSignature,
-      });
-      console.log('Webhook verified successfully');
-    } catch (err) {
-      console.error('Webhook verification error:', err);
-      console.error('Error details:', {
-        message: err.message,
-        stack: err.stack,
-      });
-      return res.status(400).json({ error: 'Invalid signature', details: err.message });
-    }
-
-    // Handle the webhook event
-    const eventType = evt.type;
-    console.log('Received webhook event:', eventType);
-
-    try {
-      switch (eventType) {
-        case 'user.created':
-          await handleUserCreated(evt);
-          break;
-        case 'user.updated':
-          await handleUserUpdated(evt);
-          break;
-        case 'user.deleted':
-          await handleUserDeleted(evt);
-          break;
-        default:
-          console.log('Unhandled event type:', eventType);
-      }
-    } catch (handlerError) {
-      console.error('Error in event handler:', handlerError);
-      console.error('Handler error stack:', handlerError.stack);
-      throw handlerError;
-    }
-
-    res.status(200).json({ received: true, event: eventType });
-  } catch (error) {
-    console.error('Webhook error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Internal server error', 
-      message: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+  } catch (err) {
+    console.error(`Error processing webhook ${type}:`, err);
+    return res.status(400).json({ 
+      success: false, 
+      error: err.message 
     });
   }
 });
