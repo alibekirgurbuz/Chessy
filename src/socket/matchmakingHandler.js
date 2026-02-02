@@ -48,8 +48,14 @@ function matchmakingHandler(io, socket) {
             });
             console.log(`User ${socket.userId} (${userType}) started matchmaking for ${tempo} ${timeControl}`);
 
-            // Eşleşme bulmaya çalış
-            const match = await matchmakingService.findMatch(socket.userId);
+            // Parse timeControl string (e.g., "3+0" -> { time: 3, increment: 0 })
+            const [timeMinutes, incrementSeconds] = timeControl.split('+').map(Number);
+
+            // Eşleşme bulmaya çalış - pass parsed timeControl
+            const match = await matchmakingService.findMatch(socket.userId, {
+                time: timeMinutes,
+                increment: incrementSeconds
+            });
 
             if (match) {
                 console.log(`Match found! Game ID: ${match.game._id}`);
@@ -84,7 +90,9 @@ function matchmakingHandler(io, socket) {
                         gameId: match.game._id,
                         whitePlayer: { _id: whitePlayerId, username: whiteUsername },
                         blackPlayer: { _id: blackPlayerId, username: blackUsername },
-                        yourColor: yourColor
+                        yourColor: yourColor,
+                        timeControl: match.game.timeControl,
+                        clock: match.game.clock
                     });
                 });
             }

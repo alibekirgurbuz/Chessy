@@ -3,14 +3,14 @@ const Game = require('../models/Game');
 
 class MatchmakingService {
     constructor() {
-        this.SEARCH_PREFIX = 'matchmaking:searching:';
-        this.ONLINE_USERS = 'online:users';
-        this.USER_QUEUE_KEY = 'matchmaking:user_queue:'; // Stores which queue a user is currently in
+        this.SEARCH_PREFIX = `${redis.appPrefix}matchmaking:searching:`;
+        this.ONLINE_USERS = `${redis.appPrefix}online:users`;
+        this.USER_QUEUE_KEY = `${redis.appPrefix}matchmaking:user_queue:`; // Stores which queue a user is currently in
     }
 
     // Generate queue key based on parameters
     getQueueKey(userType, tempo, timeControl) {
-        return `matchmaking:queue:${userType}:${tempo}:${timeControl}`;
+        return `${redis.appPrefix}matchmaking:queue:${userType}:${tempo}:${timeControl}`;
     }
 
     // Kuyruğa ekle
@@ -53,7 +53,7 @@ class MatchmakingService {
     }
 
     // Eşleşme bul
-    async findMatch(userId) {
+    async findMatch(userId, timeControl) {
         // Kullanıcının hangi kuyrukta olduğunu bul
         const queueKey = await redis.get(`${this.USER_QUEUE_KEY}${userId}`);
 
@@ -61,7 +61,7 @@ class MatchmakingService {
             return null;
         }
 
-        // Kuyruktan ilk 2 oyuncuyu al
+        // Kuyruktan ilk 2 oyunc uyu al
         const queueLength = await redis.llen(queueKey);
 
         if (queueLength < 2) {
@@ -90,12 +90,31 @@ class MatchmakingService {
             ? [player1, player2]
             : [player2, player1];
 
-        // Yeni oyun oluştur
+        // Calculate base time and increment in milliseconds
+        const baseTime = timeControl.time * 60 * 1000;
+        const increment = timeControl.increment * 1000;
+
+        // Yeni oyun oluştur with clock
         const game = new Game({
             whitePlayer: whitePlayerId,
             blackPlayer: blackPlayerId,
             pgn: '',
-            status: 'ongoing'
+            status: 'ongoing',
+            timeControl: {
+                time: timeControl.time,
+                increment: timeControl.increment,
+                label: `${timeControl.time}+${timeControl.increment}`
+            },
+            clock: {
+                whiteTime: baseTime,
+                blackTime: baseTime,
+                activeColor: null,
+                lastMoveAt: null,
+                firstMoveDeadline: Date.now() + 30000, // 30 seconds for first move
+                moveCount: 0,
+                baseTime: baseTime,
+                increment: increment
+            }
         });
 
         await game.save();
@@ -107,7 +126,9 @@ class MatchmakingService {
                 whitePlayer: { _id: whitePlayerId, username: whitePlayerId }, // Username will be fetched/enriched in handler
                 blackPlayer: { _id: blackPlayerId, username: blackPlayerId },
                 pgn: game.pgn,
-                status: game.status
+                status: game.status,
+                timeControl: game.timeControl,
+                clock: game.clock
             },
             players: [player1, player2]
         };
@@ -132,13 +153,13 @@ class MatchmakingService {
     // Tüm kuyrukları temizle (Server start'ta)
     async clearAllQueues() {
         // Queue key'lerini bul ve sil
-        const keys = await redis.keys('matchmaking:queue:*');
+        const keys = await redis.keys(`${redis.appPrefix}matchmaking:queue:*`);
         if (keys.length > 0) {
             await redis.del(...keys);
         }
 
         // User queue mappingleri sil
-        const mappingKeys = await redis.keys('matchmaking:user_queue:*');
+        const mappingKeys = await redis.keys(`${redis.appPrefix}matchmaking:user_queue:*`);
         if (mappingKeys.length > 0) {
             await redis.del(...mappingKeys);
         }

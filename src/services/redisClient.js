@@ -10,4 +10,7 @@ redis.on('error', (err) => {
     console.error('❌ Redis connection error:', err);
 });
 
+// Custom prefix for manual key namespacing
+redis.appPrefix = process.env.NODE_ENV === 'development' ? 'dev:' : '';
+
 module.exports = redis;

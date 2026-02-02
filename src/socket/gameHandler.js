@@ -1,5 +1,6 @@
 const Game = require('../models/Game');
 const { Chess } = require('chess.js');
+const ClockManager = require('../services/ClockManager');
 
 function gameHandler(io, socket) {
     // Oyuna katıl
@@ -30,7 +31,7 @@ function gameHandler(io, socket) {
                 }
             }
 
-            // Mevcut oyun durumunu gönder (FEN ve currentTurn ile)
+            // Mevcut oyun durumunu gönder (FEN ve currentTurn ile + CLOCK)
             socket.emit('game_state', {
                 game: {
                     ...game.toObject(),
@@ -38,6 +39,12 @@ function gameHandler(io, socket) {
                     currentTurn: chess.turn()
                 }
             });
+
+            // Send initial clock update
+            if (game.clock) {
+                const clock = ClockManager.fromJSON(game.clock);
+                io.to(gameId).emit('clock_update', clock.getState());
+            }
 
             console.log(`User ${socket.userId} joined game ${gameId}, FEN: ${chess.fen()}`);
 
@@ -47,8 +54,8 @@ function gameHandler(io, socket) {
         }
     });
 
-    // Hamle yap
-    socket.on('make_move', async ({ gameId, move }) => {
+    // Hamle yap (WITH CLOCK LOGIC)
+    socket.on('make_move', async ({ gameId, move, clientTimestamp }) => {
         try {
             const game = await Game.findById(gameId);
 
@@ -83,6 +90,53 @@ function gameHandler(io, socket) {
                 return socket.emit('error', { message: 'Invalid move' });
             }
 
+            // ========== CLOCK LOGIC START ==========
+            let clockState = null;
+            if (game.clock) {
+                const clock = ClockManager.fromJSON(game.clock);
+                const playerColor = isWhitePlayer ? 'w' : 'b';
+
+                console.log('🕐 Clock Debug:', {
+                    playerColor,
+                    activeColor: clock.activeColor,
+                    isWhitePlayer,
+                    userId: socket.userId,
+                    whitePlayer: game.whitePlayer.toString(),
+                    blackPlayer: game.blackPlayer.toString()
+                });
+
+                try {
+                    clockState = clock.makeMove(playerColor, clientTimestamp || Date.now());
+
+                    // Check for timeout
+                    if (clockState.timeout) {
+                        game.status = 'completed';
+                        game.result = clockState.winner;
+                        game.clock = clock.toJSON();
+                        await game.save();
+
+                        // Emit game over due to timeout
+                        io.to(gameId).emit('game_over', {
+                            gameId,
+                            result: clockState.winner,
+                            reason: 'timeout'
+                        });
+
+                        // Emit final clock state
+                        io.to(gameId).emit('clock_update', clockState);
+                        return;
+                    }
+
+                    // Update game clock in database
+                    game.clock = clock.toJSON();
+
+                } catch (clockError) {
+                    console.error('Clock error:', clockError);
+                    return socket.emit('error', { message: clockError.message });
+                }
+            }
+            // ========== CLOCK LOGIC END ==========
+
             // PGN'i güncelle
             game.pgn = chess.pgn();
             game.updatedAt = Date.now();
@@ -111,6 +165,11 @@ function gameHandler(io, socket) {
                 fen: chess.fen()
             });
 
+            // Broadcast clock update
+            if (clockState) {
+                io.to(gameId).emit('clock_update', clockState);
+            }
+
             // Oyun bittiyse bildir
             if (game.status === 'completed') {
                 io.to(gameId).emit('game_over', {
@@ -134,6 +193,7 @@ function gameHandler(io, socket) {
         socket.to(gameId).emit('opponent_disconnected');
         console.log(`User ${socket.userId} left game ${gameId}`);
     });
+
     // Pes et
     socket.on('resign_game', async ({ gameId }) => {
         try {

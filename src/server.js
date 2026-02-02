@@ -11,6 +11,7 @@ const gameRoutes = require('./routes/games');
 const matchmakingRoutes = require('./routes/matchmaking');
 const errorHandler = require('./middleware/errorHandler');
 const setupSocket = require('./socket');
+const TimeoutChecker = require('./services/TimeoutChecker');
 
 // Connect to database
 connectDB();
@@ -23,6 +24,10 @@ const server = http.createServer(app);
 
 // Setup Socket.io
 const io = setupSocket(server);
+
+// Start TimeoutChecker background service
+const timeoutChecker = new TimeoutChecker(io);
+timeoutChecker.start();
 
 // Middleware
 app.use(helmet({
@@ -51,4 +56,15 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready`);
+  console.log('\u23f1\ufe0f  TimeoutChecker service active');
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  timeoutChecker.stop();
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
 });

@@ -9,7 +9,7 @@ const redis = require('../services/redisClient');
 // Clear stale online users on server startup
 async function clearOnlineUsersOnStartup() {
     try {
-        await redis.del('online:users');
+        await redis.del(`${redis.appPrefix}online:users`);
         await matchmakingHandler.clearAllQueues ? matchmakingHandler.clearAllQueues() : null; // Handler'da değil Service'te
 
         // Service direct import for cleanup
@@ -17,7 +17,7 @@ async function clearOnlineUsersOnStartup() {
         await matchmakingService.clearAllQueues();
 
         // Clear all searching states
-        const keys = await redis.keys('matchmaking:searching:*');
+        const keys = await redis.keys(`${redis.appPrefix}matchmaking:searching:*`);
         if (keys.length > 0) {
             await redis.del(...keys);
         }
