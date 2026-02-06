@@ -2,6 +2,7 @@ const { Server } = require('socket.io');
 const gameHandler = require('./gameHandler');
 const matchmakingHandler = require('./matchmakingHandler');
 const aiHandler = require('./aiHandler');
+const roomHandler = require('./roomHandler');
 const { verifyClerkToken } = require('../middleware/clerkAuth');
 const User = require('../models/User');
 const redis = require('../services/redisClient');
@@ -121,6 +122,9 @@ function setupSocket(server) {
 
         // AI game events
         aiHandler(io, socket);
+
+        // Room events (friend invites)
+        roomHandler(io, socket);
 
         // Disconnect
         socket.on('disconnect', async () => {

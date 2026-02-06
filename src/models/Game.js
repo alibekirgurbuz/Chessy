@@ -20,7 +20,21 @@ const gameSchema = new mongoose.Schema(
     },
     result: {
       type: String,
-      enum: ['white', 'black', 'draw', null],
+      enum: ['white', 'black', 'draw', 'aborted', null],
+      default: null,
+    },
+    // Private room fields
+    roomId: {
+      type: String,
+      index: true,
+    },
+    isPrivate: {
+      type: Boolean,
+      default: false,
+    },
+    roomStatus: {
+      type: String,
+      enum: ['waiting', 'playing', 'completed', 'expired', null],
       default: null,
     },
     timeControl: {

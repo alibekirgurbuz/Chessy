@@ -238,6 +238,60 @@ function gameHandler(io, socket) {
             socket.emit('error', { message: error.message });
         }
     });
+    // İlk hamle yapılmadığı için maçı iptal et
+    socket.on('cancel_game', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+
+            if (!game) {
+                return socket.emit('error', { message: 'Game not found' });
+            }
+
+            // Kullanıcının oyunda olduğunu kontrol et
+            const isPlayer = game.whitePlayer.toString() === socket.userId ||
+                game.blackPlayer.toString() === socket.userId;
+
+            if (!isPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'ongoing') {
+                return socket.emit('error', { message: 'Game is not active' });
+            }
+
+            // İlk hamle kontrolü (Oyun başında olmalı)
+            const chess = new Chess();
+            if (game.pgn) {
+                chess.loadPgn(game.pgn);
+            }
+
+            // Sadece ilk 2 hamle içinde iptal edilebilir (White 1. hamle veya Black 1. hamle)
+            if (chess.history().length >= 2) {
+                return socket.emit('error', { message: 'Cannot cancel game after first moves' });
+            }
+
+            // İptal et
+            game.status = 'completed';
+            game.result = 'aborted';
+            game.resultReason = 'cancelled_due_to_first_move_timeout';
+            game.updatedAt = Date.now();
+
+            await game.save();
+
+            // Odadaki herkese bildir
+            io.to(gameId).emit('game_over', {
+                gameId,
+                result: 'aborted',
+                reason: 'cancelled_due_to_first_move_timeout'
+            });
+
+            console.log(`Game ${gameId} cancelled because first move timeout`);
+
+        } catch (error) {
+            console.error('cancel_game error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
 }
 
 module.exports = gameHandler;
