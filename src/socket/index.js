@@ -36,7 +36,10 @@ function setupSocket(server) {
         cors: {
             origin: '*', // Development için tüm origin'lere izin ver
             methods: ['GET', 'POST']
-        }
+        },
+        // Ping tuning for mobile stability
+        pingInterval: 25000, // 25s ping interval
+        pingTimeout: 60000,  // 60s timeout - slow networks için
     });
 
     // Middleware: Socket authentication with Clerk JWT support
