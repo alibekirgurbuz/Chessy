@@ -2,7 +2,7 @@ const Game = require('../models/Game');
 const { Chess } = require('chess.js');
 const ClockManager = require('../services/ClockManager');
 
-function gameHandler(io, socket) {
+function gameHandler(io, socket, onlineUsers) {
     // Oyuna katıl
     socket.on('join_game', async ({ gameId }) => {
         try {
@@ -31,12 +31,51 @@ function gameHandler(io, socket) {
                 }
             }
 
+            // Fetch user details for white and black players to get isOnline status
+            // (Since populate might fail if schema refs are missing or types mismatch)
+            const User = require('../models/User');
+            const mongoose = require('mongoose');
+
+            const whiteId = game.whitePlayer.toString();
+            const blackId = game.blackPlayer.toString();
+
+            // Only query DB for valid ObjectIds (registered users)
+            const userIdsToFetch = [whiteId, blackId].filter(id => mongoose.Types.ObjectId.isValid(id));
+
+            let players = [];
+            if (userIdsToFetch.length > 0) {
+                try {
+                    players = await User.find({ _id: { $in: userIdsToFetch } });
+                } catch (err) {
+                    console.error('Error fetching users in join_game:', err);
+                }
+            }
+
+            const whiteUser = players.find(p => p._id.toString() === whiteId);
+            const blackUser = players.find(p => p._id.toString() === blackId);
+
+            const whitePlayerInfo = {
+                _id: whiteId,
+                username: whiteUser ? whiteUser.username : (whiteId.startsWith('user_') ? 'Misafir Oyuncu' : 'Unknown'),
+                isOnline: (whiteUser && whiteUser.isOnline) || (onlineUsers && onlineUsers.has(whiteId)) || false
+            };
+
+            const blackPlayerInfo = {
+                _id: blackId,
+                username: blackUser ? blackUser.username : (blackId.startsWith('user_') ? 'Misafir Oyuncu' : 'Unknown'),
+                isOnline: (blackUser && blackUser.isOnline) || (onlineUsers && onlineUsers.has(blackId)) || false
+            };
+
             // Mevcut oyun durumunu gönder (FEN ve currentTurn ile + CLOCK)
             socket.emit('game_state', {
                 game: {
                     ...game.toObject(),
+                    whitePlayer: whitePlayerInfo,
+                    blackPlayer: blackPlayerInfo,
                     fen: chess.fen(),
-                    currentTurn: chess.turn()
+                    currentTurn: chess.turn(),
+                    moveCount: chess.history().length,
+                    serverTimestamp: Date.now()
                 }
             });
 
@@ -147,8 +186,10 @@ function gameHandler(io, socket) {
                 if (chess.isCheckmate()) {
                     // Kazananı belirle (sıra kimde ise o kaybetti)
                     game.result = chess.turn() === 'w' ? 'black' : 'white';
+                    game.resultReason = 'checkmate';
                 } else if (chess.isDraw()) {
                     game.result = 'draw';
+                    game.resultReason = chess.isStalemate() ? 'stalemate' : 'draw';
                 }
             }
 
@@ -162,7 +203,8 @@ function gameHandler(io, socket) {
                 to: moveResult.to,
                 pgn: game.pgn,
                 currentTurn: chess.turn(),
-                fen: chess.fen()
+                fen: chess.fen(),
+                moveCount: chess.history().length
             });
 
             // Broadcast clock update
@@ -190,7 +232,7 @@ function gameHandler(io, socket) {
     // Oyundan ayrıl
     socket.on('leave_game', ({ gameId }) => {
         socket.leave(gameId);
-        socket.to(gameId).emit('opponent_disconnected');
+        socket.to(gameId).emit('opponent_disconnected', { playerId: socket.userId });
         console.log(`User ${socket.userId} left game ${gameId}`);
     });
 
@@ -220,6 +262,7 @@ function gameHandler(io, socket) {
             // Kazananı belirle (Resign eden kaybeder)
             game.status = 'completed';
             game.result = isWhitePlayer ? 'black' : 'white';
+            game.resultReason = 'resignation';
             game.updatedAt = Date.now();
 
             await game.save();

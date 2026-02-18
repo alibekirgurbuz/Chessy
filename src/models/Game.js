@@ -15,12 +15,16 @@ const gameSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ['ongoing', 'completed', 'abandoned', 'cancelled_no_first_move'],
+      enum: ['ongoing', 'completed', 'abandoned'],
       default: 'ongoing',
     },
     result: {
       type: String,
       enum: ['white', 'black', 'draw', 'aborted', null],
+      default: null,
+    },
+    resultReason: {
+      type: String,
       default: null,
     },
     // Private room fields

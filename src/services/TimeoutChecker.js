@@ -44,23 +44,22 @@ class TimeoutChecker {
      */
     async checkTimeouts() {
         try {
-            // Find all ongoing games
-            const games = await Game.find({ status: 'ongoing' });
+            // Find all ongoing games with a clock
+            const games = await Game.find({ status: 'ongoing', clock: { $ne: null } });
 
             for (const game of games) {
-                // Skip games without clock
-                if (!game.clock || !game.clock.lastMoveAt) continue;
+                if (!game.clock) continue;
 
                 const clock = ClockManager.fromJSON(game.clock);
 
-                // Check first move deadline
+                // 1) Check first-move deadline FIRST (does NOT require lastMoveAt)
                 if (clock.isFirstMoveExpired()) {
                     await this.handleFirstMoveTimeout(game);
                     continue;
                 }
 
-                // Check regular timeout
-                if (clock.isTimeout()) {
+                // 2) Check regular timeout (requires active clock with lastMoveAt)
+                if (clock.lastMoveAt && clock.isTimeout()) {
                     const times = clock.getCurrentTime();
                     const winner = times.whiteTime <= 0 ? 'black' : 'white';
                     await this.handleTimeout(game, winner);
@@ -72,23 +71,28 @@ class TimeoutChecker {
     }
 
     /**
-     * Handle first move timeout - cancel the game
+     * Handle first move timeout - abort the game
+     * Uses status='completed', result='aborted', reason='cancelled_due_to_first_move_timeout'
      */
     async handleFirstMoveTimeout(game) {
         try {
+            // Guard: re-check status to prevent duplicate termination from concurrent ticks
+            const freshGame = await Game.findById(game._id);
+            if (!freshGame || freshGame.status !== 'ongoing') return;
+
             console.log(`⏱️  First move timeout for game ${game._id}`);
 
-            game.status = 'cancelled_no_first_move';
-            game.result = null;
-            game.updatedAt = Date.now();
-            await game.save();
+            freshGame.status = 'completed';
+            freshGame.result = 'aborted';
+            freshGame.resultReason = 'cancelled_due_to_first_move_timeout';
+            freshGame.updatedAt = Date.now();
+            await freshGame.save();
 
-            // Notify players
+            // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {
                 gameId: game._id,
-                result: null,
-                reason: 'first_move_timeout',
-                message: 'Game cancelled: White did not make first move in time'
+                result: 'aborted',
+                reason: 'cancelled_due_to_first_move_timeout'
             });
 
         } catch (error) {
@@ -98,22 +102,27 @@ class TimeoutChecker {
 
     /**
      * Handle regular timeout - end game with winner
+     * Uses status='completed', result=winner, reason='timeout'
      */
     async handleTimeout(game, winner) {
         try {
+            // Guard: re-check status to prevent duplicate termination from concurrent ticks
+            const freshGame = await Game.findById(game._id);
+            if (!freshGame || freshGame.status !== 'ongoing') return;
+
             console.log(`⏱️  Timeout in game ${game._id}, winner: ${winner}`);
 
-            game.status = 'completed';
-            game.result = winner;
-            game.updatedAt = Date.now();
-            await game.save();
+            freshGame.status = 'completed';
+            freshGame.result = winner;
+            freshGame.resultReason = 'timeout';
+            freshGame.updatedAt = Date.now();
+            await freshGame.save();
 
-            // Notify players
+            // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {
                 gameId: game._id,
                 result: winner,
-                reason: 'timeout',
-                winner
+                reason: 'timeout'
             });
 
         } catch (error) {

@@ -118,7 +118,7 @@ function setupSocket(server) {
         });
 
         // Game events
-        gameHandler(io, socket);
+        gameHandler(io, socket, onlineUsers);
 
         // Matchmaking events
         matchmakingHandler(io, socket);
@@ -128,6 +128,18 @@ function setupSocket(server) {
 
         // Room events (friend invites)
         roomHandler(io, socket);
+
+        // Handle disconnecting (before rooms are left)
+        socket.on('disconnecting', () => {
+            // socket.rooms is a Set containing socket.id and joined rooms
+            for (const room of socket.rooms) {
+                if (room !== socket.id) {
+                    // It's likely a game room or other room.
+                    // Emit to the room that this player disconnected.
+                    socket.to(room).emit('opponent_disconnected', { playerId: userId });
+                }
+            }
+        });
 
         // Disconnect
         socket.on('disconnect', async () => {
