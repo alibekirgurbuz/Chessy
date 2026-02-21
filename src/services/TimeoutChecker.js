@@ -44,21 +44,34 @@ class TimeoutChecker {
      */
     async checkTimeouts() {
         try {
-            // Find all ongoing games with a clock
-            const games = await Game.find({ status: 'ongoing', clock: { $ne: null } });
+            // Find all ongoing games with a clock or a pending disconnect deadline
+            const games = await Game.find({
+                status: 'ongoing',
+                $or: [
+                    { clock: { $ne: null } },
+                    { disconnectDeadlineAt: { $ne: null } }
+                ]
+            });
 
             for (const game of games) {
+                // 1) Check disconnect deadline FIRST
+                if (game.disconnectDeadlineAt && Date.now() >= game.disconnectDeadlineAt) {
+                    const winner = game.disconnectedPlayerId === game.whitePlayer.toString() ? 'black' : 'white';
+                    await this.handleDisconnectTimeout(game, winner);
+                    continue; // Skip clock checks if game is forfeit
+                }
+
                 if (!game.clock) continue;
 
                 const clock = ClockManager.fromJSON(game.clock);
 
-                // 1) Check first-move deadline FIRST (does NOT require lastMoveAt)
+                // 2) Check first-move deadline (does NOT require lastMoveAt)
                 if (clock.isFirstMoveExpired()) {
                     await this.handleFirstMoveTimeout(game);
                     continue;
                 }
 
-                // 2) Check regular timeout (requires active clock with lastMoveAt)
+                // 3) Check regular timeout (requires active clock with lastMoveAt)
                 if (clock.lastMoveAt && clock.isTimeout()) {
                     const times = clock.getCurrentTime();
                     const winner = times.whiteTime <= 0 ? 'black' : 'white';
@@ -127,6 +140,41 @@ class TimeoutChecker {
 
         } catch (error) {
             console.error('Timeout handler error:', error);
+        }
+    }
+
+    /**
+     * Handle disconnect timeout - end game with winner
+     * Uses status='completed', result=winner, reason='disconnect_timeout'
+     */
+    async handleDisconnectTimeout(game, winner) {
+        try {
+            // Guard: re-check status to prevent duplicate termination from concurrent ticks
+            const freshGame = await Game.findById(game._id);
+            if (!freshGame || freshGame.status !== 'ongoing') return;
+
+            console.log(`⏱️  Disconnect timeout in game ${game._id}, winner: ${winner}`);
+
+            freshGame.status = 'completed';
+            freshGame.result = winner;
+            freshGame.resultReason = 'disconnect_timeout';
+
+            // Clear pending disconnection fields
+            freshGame.disconnectedPlayerId = null;
+            freshGame.disconnectDeadlineAt = null;
+
+            freshGame.updatedAt = Date.now();
+            await freshGame.save();
+
+            // Notify players — aligned to GameOverPayload
+            this.io.to(game._id.toString()).emit('game_over', {
+                gameId: game._id,
+                result: winner,
+                reason: 'disconnect_timeout'
+            });
+
+        } catch (error) {
+            console.error('Disconnect timeout handler error:', error);
         }
     }
 }

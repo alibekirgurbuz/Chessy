@@ -13,9 +13,6 @@ const errorHandler = require('./middleware/errorHandler');
 const setupSocket = require('./socket');
 const TimeoutChecker = require('./services/TimeoutChecker');
 
-// Connect to database
-connectDB();
-
 // Initialize Express app
 const app = express();
 
@@ -25,9 +22,7 @@ const server = http.createServer(app);
 // Setup Socket.io
 const io = setupSocket(server);
 
-// Start TimeoutChecker background service
-const timeoutChecker = new TimeoutChecker(io);
-timeoutChecker.start();
+let timeoutChecker;
 
 // Middleware
 app.use(helmet({
@@ -50,19 +45,28 @@ app.use('/api/matchmaking', matchmakingRoutes);
 // Error handler (must be last)
 app.use(errorHandler);
 
-// Start server
-const PORT = process.env.PORT || 5000;
+// Connect to database and then start server services
+connectDB().then(() => {
+  // Start TimeoutChecker background service
+  timeoutChecker = new TimeoutChecker(io);
+  timeoutChecker.start();
 
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📡 WebSocket server ready`);
-  console.log('\u23f1\ufe0f  TimeoutChecker service active');
+  // Start server
+  const PORT = process.env.PORT || 5000;
+
+  server.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📡 WebSocket server ready`);
+  });
+}).catch(err => {
+  console.error('Failed to connect to database', err);
+  process.exit(1);
 });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
-  timeoutChecker.stop();
+  if (timeoutChecker) timeoutChecker.stop();
   server.close(() => {
     console.log('Server closed');
     process.exit(0);

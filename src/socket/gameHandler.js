@@ -16,6 +16,15 @@ function gameHandler(io, socket, onlineUsers) {
             // Socket'i oyun odasına ekle
             socket.join(gameId);
 
+            // Cancel any pending disconnect timeout if the disconnected user is rejoining
+            if (game.disconnectedPlayerId === socket.userId) {
+                game.disconnectedPlayerId = null;
+                game.disconnectDeadlineAt = null;
+                await game.save();
+                io.to(gameId).emit('opponent_reconnected', { playerId: socket.userId });
+                console.log(`User ${socket.userId} reconnected to game ${gameId}, cancelled disconnect timeout.`);
+            }
+
             // Odadaki diğer kullanıcılara bildir
             socket.to(gameId).emit('opponent_joined', {
                 opponentId: socket.userId

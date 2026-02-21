@@ -27,6 +27,14 @@ const gameSchema = new mongoose.Schema(
       type: String,
       default: null,
     },
+    disconnectedPlayerId: {
+      type: String, // userId of the disconnected player
+      default: null,
+    },
+    disconnectDeadlineAt: {
+      type: Number, // timestamp
+      default: null,
+    },
     // Private room fields
     roomId: {
       type: String,
