@@ -92,6 +92,18 @@ const gameSchema = new mongoose.Schema(
         type: Number, // milliseconds
       },
     },
+    queuedPremoves: {
+      white: {
+        from: { type: String, default: null },
+        to: { type: String, default: null },
+        promotion: { type: String, default: null },
+      },
+      black: {
+        from: { type: String, default: null },
+        to: { type: String, default: null },
+        promotion: { type: String, default: null },
+      },
+    },
   },
   {
     timestamps: true,
