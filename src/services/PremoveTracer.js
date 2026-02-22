@@ -87,6 +87,8 @@ class PremoveTrace {
             execute_duration_ms: derive('premove_execute_start', 'premove_execute_end'),
             execute_to_broadcast_ms: derive('premove_execute_end', 'move_broadcast_sent'),
             flip_to_broadcast_ms: derive('turn_flipped', 'move_broadcast_sent'),
+            db_persist_duration_ms: derive('premove_db_persist_start', 'premove_db_persist_end'),
+            broadcast_emit_duration_ms: derive('premove_broadcast_start', 'premove_broadcast_end'),
         };
 
         const entry = {

@@ -109,6 +109,10 @@ function buildSummariesFromTraces(traces) {
             execute_duration_ms: (execStart && execEnd) ? execEnd.ts - execStart.ts : null,
             execute_to_broadcast_ms: (execEnd && broadcast) ? broadcast.ts - execEnd.ts : null,
             flip_to_broadcast_ms: (flipTs != null && broadcast) ? broadcast.ts - flipTs : null,
+            db_persist_duration_ms: (byEvent['premove_db_persist_start'] && byEvent['premove_db_persist_end'])
+                ? byEvent['premove_db_persist_end'].ts - byEvent['premove_db_persist_start'].ts : null,
+            broadcast_emit_duration_ms: (byEvent['premove_broadcast_start'] && byEvent['premove_broadcast_end'])
+                ? byEvent['premove_broadcast_end'].ts - byEvent['premove_broadcast_start'].ts : null,
         };
 
         synthetics.push({
@@ -153,6 +157,8 @@ function computeStats(summaries, minutesCutoff) {
         'execute_duration_ms',
         'execute_to_broadcast_ms',
         'flip_to_broadcast_ms',
+        'db_persist_duration_ms',
+        'broadcast_emit_duration_ms',
     ];
 
     const stats = {};
@@ -219,6 +225,8 @@ function generateReport(stats) {
         execute_duration_ms: 'Execute duration',
         execute_to_broadcast_ms: 'Execute end → Broadcast',
         flip_to_broadcast_ms: 'Turn flip → Broadcast (E2E)',
+        db_persist_duration_ms: 'DB persist duration',
+        broadcast_emit_duration_ms: 'Broadcast emit duration',
     };
 
     for (const [key, label] of Object.entries(metricLabels)) {
@@ -245,12 +253,52 @@ function generateReport(stats) {
         md += `- \`flip_to_broadcast_ms\` p95: **${flipToBroadcast.p95}ms**\n`;
     }
 
+    // ── Top bottleneck identification ──
+    const bottleneckMetrics = [
+        { key: 'execute_duration_ms', label: 'Execute duration' },
+        { key: 'execute_to_broadcast_ms', label: 'Execute end → Broadcast' },
+        { key: 'flip_to_found_ms', label: 'Turn flip → Found queued' },
+    ];
+    let topBottleneck = null;
+    let topBottleneckP95 = 0;
+    for (const bm of bottleneckMetrics) {
+        const s = stats.metrics[bm.key];
+        if (s && s.p95 != null && s.p95 > topBottleneckP95) {
+            topBottleneckP95 = s.p95;
+            topBottleneck = bm;
+        }
+    }
+    if (topBottleneck) {
+        md += `\n## Top Bottleneck\n\n`;
+        md += `| Metric | p95 |\n|--------|-----|\n`;
+        md += `| ${topBottleneck.label} (\`${topBottleneck.key}\`) | **${topBottleneckP95}ms** |\n`;
+    }
+
     md += `\n## Verdict\n\n`;
-    md += `> Server-side premove executes within the same Node.js event loop tick as the\n`;
-    md += `> turn flip. The \`flip_to_execute_end_ms\` value confirms that **no extra RTT\n`;
-    md += `> is required** — premove validation + chess.js move + clock update all complete\n`;
-    md += `> in sub-millisecond time on server. Broadcast latency depends on Socket.IO\n`;
-    md += `> send buffer and network, but is typically < 1ms for local connections.\n`;
+
+    if (stats.executedCount === 0) {
+        md += `> ⚠️ **Insufficient data** — no executed premoves found in the log.\n`;
+        md += `> Play some games with premoves and re-run the benchmark.\n`;
+    } else {
+        const p95Val = flipToExec && flipToExec.p95 != null ? flipToExec.p95 : null;
+        const passed = p95Val != null && p95Val < 10;
+
+        if (passed) {
+            md += `> ✅ **PASS** — \`flip_to_execute_end_ms\` p95 = **${p95Val}ms** (< 10ms target).\n`;
+            md += `> Server-side premove executes within the same event-loop tick as the\n`;
+            md += `> turn flip with no extra RTT required.\n`;
+        } else {
+            md += `> ❌ **FAIL** — \`flip_to_execute_end_ms\` p95 = **${p95Val}ms** (target < 10ms).\n`;
+            md += `> Tail latency detected. `;
+            if (topBottleneck) {
+                md += `Top bottleneck: **${topBottleneck.label}** (p95 = ${topBottleneckP95}ms).\n`;
+            } else {
+                md += `Investigate DB persist and event-loop contention.\n`;
+            }
+            md += `> Consider: narrow DB updates (\`updateOne\`), broadcast-before-persist,\n`;
+            md += `> or reducing event-loop blocking in the \`make_move\` handler.\n`;
+        }
+    }
 
     return md;
 }

@@ -1,13 +1,13 @@
 # Premove Latency Report
 
-**Generated:** 2026-02-22T12:24:28.792Z
+**Generated:** 2026-02-22T13:00:41.240Z
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
-| Total traces | 24 |
-| Executed | 0 |
+| Total traces | 14 |
+| Executed | 14 |
 | Rejected | 0 |
 | Reject rate | 0% |
 
@@ -15,21 +15,29 @@
 
 | Metric | Count | p50 | p95 | p99 | Min | Max | Avg |
 |--------|-------|-----|-----|-----|-----|-----|-----|
-| Turn flip → Found queued | 0 | - | - | - | - | - | - |
-| Turn flip → Execute start | 0 | - | - | - | - | - | - |
-| Turn flip → Execute end | 0 | - | - | - | - | - | - |
-| Execute duration | 0 | - | - | - | - | - | - |
-| Execute end → Broadcast | 0 | - | - | - | - | - | - |
-| Turn flip → Broadcast (E2E) | 0 | - | - | - | - | - | - |
+| Turn flip → Found queued | 14 | 0ms | 1ms | 1ms | 0ms | 1ms | 0.286ms |
+| Turn flip → Execute start | 14 | 0ms | 3ms | 3ms | 0ms | 3ms | 0.5ms |
+| Turn flip → Execute end | 14 | 1ms | 96ms | 96ms | 0ms | 96ms | 8.143ms |
+| Execute duration | 14 | 1ms | 96ms | 96ms | 0ms | 96ms | 7.643ms |
+| Execute end → Broadcast | 14 | 96ms | 176ms | 176ms | 91ms | 176ms | 108.429ms |
+| Turn flip → Broadcast (E2E) | 14 | 98ms | 196ms | 196ms | 91ms | 196ms | 116.571ms |
+| DB persist duration | 0 | - | - | - | - | - | - |
+| Broadcast emit duration | 0 | - | - | - | - | - | - |
 
 ## Pass/Fail Criteria
 
-- `flip_to_execute_end_ms` p95: **No data**
+- `flip_to_execute_end_ms` p95: **96ms** ❌ FAIL (≥10ms)
+- `flip_to_broadcast_ms` p95: **196ms**
+
+## Top Bottleneck
+
+| Metric | p95 |
+|--------|-----|
+| Execute end → Broadcast (`execute_to_broadcast_ms`) | **176ms** |
 
 ## Verdict
 
-> Server-side premove executes within the same Node.js event loop tick as the
-> turn flip. The `flip_to_execute_end_ms` value confirms that **no extra RTT
-> is required** — premove validation + chess.js move + clock update all complete
-> in sub-millisecond time on server. Broadcast latency depends on Socket.IO
-> send buffer and network, but is typically < 1ms for local connections.
+> ❌ **FAIL** — `flip_to_execute_end_ms` p95 = **96ms** (target < 10ms).
+> Tail latency detected. Top bottleneck: **Execute end → Broadcast** (p95 = 176ms).
+> Consider: narrow DB updates (`updateOne`), broadcast-before-persist,
+> or reducing event-loop blocking in the `make_move` handler.
