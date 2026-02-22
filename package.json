@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
+    "test": "jest --verbose",
     "clean": "rm -rf node_modules"
   },
   "dependencies": {

@@ -29,16 +29,24 @@ class PremoveManager {
      * Set a premove for a player color. Overwrites any existing premove.
      * @param {string} gameId
      * @param {'white'|'black'} color
-     * @param {{ from: string, to: string, promotion?: string }} premove
+     * @param {{ from: string, to: string, promotion?: string, setAt?: number, sourceMoveNo?: number }} premove
      */
     setPremove(gameId, color, premove) {
         const entry = this._ensure(gameId);
-        entry[color] = { from: premove.from, to: premove.to, promotion: premove.promotion || undefined };
+        entry[color] = {
+            from: premove.from,
+            to: premove.to,
+            promotion: premove.promotion || undefined,
+            setAt: premove.setAt || Date.now(),
+            sourceMoveNo: premove.sourceMoveNo ?? null,
+        };
 
         logger.debug(`📋 [PremoveManager] premove_set`, {
             gameId, player: color,
             from: premove.from, to: premove.to,
-            promotion: premove.promotion || null
+            promotion: premove.promotion || null,
+            setAt: entry[color].setAt,
+            sourceMoveNo: entry[color].sourceMoveNo
         });
     }
 
@@ -46,12 +54,22 @@ class PremoveManager {
      * Get the queued premove for a player color.
      * @param {string} gameId
      * @param {'white'|'black'} color
-     * @returns {{ from: string, to: string, promotion?: string } | null}
+     * @returns {{ from: string, to: string, promotion?: string, setAt: number, sourceMoveNo: number|null } | null}
      */
     getPremove(gameId, color) {
         const entry = this._store.get(gameId);
         if (!entry) return null;
         return entry[color] || null;
+    }
+
+    /**
+     * Check if a premove exists for a player color.
+     * @param {string} gameId
+     * @param {'white'|'black'} color
+     * @returns {boolean}
+     */
+    hasPremove(gameId, color) {
+        return this.getPremove(gameId, color) !== null;
     }
 
     /**
@@ -97,6 +115,33 @@ class PremoveManager {
         }
         this._store.delete(gameId);
         this._locks.delete(gameId);
+    }
+
+    /**
+     * Rehydrate in-memory premove store from a DB-shaped queuedPremoves object.
+     * Called on join_game / server restart to sync in-memory state with DB.
+     * @param {string} gameId
+     * @param {{ white: object|null, black: object|null }} queuedPremoves
+     */
+    rehydrate(gameId, queuedPremoves) {
+        if (!queuedPremoves) return;
+        const entry = this._ensure(gameId);
+        for (const color of ['white', 'black']) {
+            const p = queuedPremoves[color];
+            if (p && p.from && p.to) {
+                entry[color] = {
+                    from: p.from,
+                    to: p.to,
+                    promotion: p.promotion || undefined,
+                    setAt: p.setAt || null,
+                    sourceMoveNo: p.sourceMoveNo ?? null,
+                };
+                logger.debug(`♻️ [PremoveManager] rehydrated`, {
+                    gameId, player: color,
+                    from: p.from, to: p.to
+                });
+            }
+        }
     }
 
     /**

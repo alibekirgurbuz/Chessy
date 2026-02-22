@@ -1,12 +1,12 @@
 # Premove Latency Report
 
-**Generated:** 2026-02-22T11:55:31.018Z
+**Generated:** 2026-02-22T12:24:28.792Z
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
-| Total traces | 30 |
+| Total traces | 24 |
 | Executed | 0 |
 | Rejected | 0 |
 | Reject rate | 0% |

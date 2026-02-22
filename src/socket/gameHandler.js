@@ -24,7 +24,11 @@ function gameHandler(io, socket, onlineUsers) {
         trace.mark('turn_flipped');
 
         const queuedPremove = premoveManager.getPremove(gameId, premoveColor);
-        logger.debug('[PREMOVE_DIAG] execute_premove_lookup', { gameId, premoveColor, hasQueuedPremove: !!queuedPremove });
+        logger.debug('[PREMOVE_DIAG] execute_premove_lookup', {
+            gameId, premoveColor, hasQueuedPremove: !!queuedPremove,
+            setAt: queuedPremove ? queuedPremove.setAt : null,
+            sourceMoveNo: queuedPremove ? queuedPremove.sourceMoveNo : null
+        });
         if (!queuedPremove) return;
 
         // ── TRACE: queued_premove_found ──
@@ -323,6 +327,11 @@ function gameHandler(io, socket, onlineUsers) {
                 io.to(gameId).emit('clock_update', clock.getState());
             }
 
+            // Rehydrate premoves from DB into in-memory manager
+            if (game.queuedPremoves) {
+                premoveManager.rehydrate(gameId, game.queuedPremoves);
+            }
+
             logger.debug(`User ${socket.userId} joined game ${gameId}, FEN: ${chess.fen()}`);
 
         } catch (error) {
@@ -536,7 +545,15 @@ function gameHandler(io, socket, onlineUsers) {
                 }
 
                 // Store premove (overwrites any existing)
-                premoveManager.setPremove(gameId, playerColor, premove);
+                const setAt = Date.now();
+                const sourceMoveNo = chess.history().length;
+                premoveManager.setPremove(gameId, playerColor, {
+                    from: premove.from,
+                    to: premove.to,
+                    promotion: premove.promotion || undefined,
+                    setAt,
+                    sourceMoveNo
+                });
 
                 // Persist to DB
                 if (!game.queuedPremoves) {
@@ -545,10 +562,12 @@ function gameHandler(io, socket, onlineUsers) {
                 game.queuedPremoves[playerColor] = {
                     from: premove.from,
                     to: premove.to,
-                    promotion: premove.promotion || null
+                    promotion: premove.promotion || null,
+                    setAt,
+                    sourceMoveNo
                 };
                 await game.save();
-                logger.debug('[PREMOVE_DIAG] set_premove_stored', { gameId, playerColor, premove: { from: premove.from, to: premove.to, promotion: premove.promotion }, persisted: true });
+                logger.debug('[PREMOVE_DIAG] set_premove_stored', { gameId, playerColor, premove: { from: premove.from, to: premove.to, promotion: premove.promotion }, setAt, sourceMoveNo, persisted: true });
 
                 // Notify room
                 io.to(gameId).emit('premove_set', {
