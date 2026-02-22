@@ -6,7 +6,10 @@ const roomHandler = require('./roomHandler');
 const User = require('../models/User');
 const Game = require('../models/Game');
 const redis = require('../services/redisClient');
+
 const mongoose = require('mongoose');
+
+const logger = require('../utils/logger');
 
 // Clear stale online users on server startup
 async function clearOnlineUsersOnStartup() {
@@ -23,9 +26,9 @@ async function clearOnlineUsersOnStartup() {
         if (keys.length > 0) {
             await redis.del(...keys);
         }
-        console.log('🧹 Cleared stale online users from Redis');
+        logger.info('🧹 Cleared stale online users from Redis');
     } catch (err) {
-        console.warn('⚠️ Could not clear Redis on startup:', err.message);
+        logger.warn('⚠️ Could not clear Redis on startup:', err.message);
     }
 }
 
@@ -38,6 +41,11 @@ function setupSocket(server) {
             origin: '*', // Development için tüm origin'lere izin ver
             methods: ['GET', 'POST']
         },
+        // WS-02: WebSocket-only mode — polling/upgrade path disabled, mobile (WS-01) ile tam uyum
+        transports: ['websocket'],
+        allowUpgrades: false,
+        // WS-03: Compression kapalı — düşük kaynaklı instance'larda (Render free tier) CPU spike/jitter azaltır
+        perMessageDeflate: false,
         // Ping tuning for mobile stability
         pingInterval: 25000, // 25s ping interval
         pingTimeout: 60000,  // 60s timeout - slow networks için
@@ -55,7 +63,7 @@ function setupSocket(server) {
                     socket.userId = result.userId;
                     socket.isClerkUser = true;
                     socket.sessionId = result.sessionId;
-                    console.log(`🔐 [Socket] Clerk user authenticated: ${result.userId}`);
+                    logger.debug(`🔐 [Socket] Clerk user authenticated: ${result.userId}`);
 
                     // Update user's online status in database
                     try {
@@ -64,16 +72,16 @@ function setupSocket(server) {
                             { isOnline: true, lastSeen: new Date() }
                         );
                     } catch (err) {
-                        console.warn('⚠️ [Socket] Could not update user status:', err.message);
+                        logger.warn('⚠️ [Socket] Could not update user status:', err.message);
                     }
 
                     return next();
                 } else {
-                    console.warn(`⚠️ [Socket] Clerk token invalid: ${result.error}`);
+                    logger.warn(`⚠️ [Socket] Clerk token invalid: ${result.error}`);
                     // Fall through to legacy auth
                 }
             } catch (err) {
-                console.warn(`⚠️ [Socket] Clerk token verification error: ${err.message}`);
+                logger.warn(`⚠️ [Socket] Clerk token verification error: ${err.message}`);
                 // Fall through to legacy auth
             }
         }
@@ -82,7 +90,7 @@ function setupSocket(server) {
         if (userId) {
             socket.userId = userId;
             socket.isClerkUser = false;
-            console.log(`🔓 [Socket] Legacy user connected: ${userId}`);
+            logger.debug(`🔓 [Socket] Legacy user connected: ${userId}`);
             return next();
         }
 
@@ -98,7 +106,7 @@ function setupSocket(server) {
         const userId = socket.userId;
         const authType = socket.isClerkUser ? 'Clerk' : 'Legacy';
 
-        console.log(`✅ User connected: ${userId} (${authType})`);
+        logger.debug(`✅ User connected: ${userId} (${authType})`);
 
         // Track online user
         if (!onlineUsers.has(userId)) {
@@ -116,7 +124,7 @@ function setupSocket(server) {
                         { isOnline: true, lastSeen: new Date() }
                     );
                 } catch (err) {
-                    console.warn('⚠️ [Socket] Could not update user status:', err.message);
+                    logger.warn('⚠️ [Socket] Could not update user status:', err.message);
                 }
             }
         });
@@ -187,7 +195,7 @@ function setupSocket(server) {
 
         // Disconnect
         socket.on('disconnect', async () => {
-            console.log(`❌ User disconnected: ${userId} (${authType})`);
+            logger.debug(`❌ User disconnected: ${userId} (${authType})`);
 
             // Remove from online users
             if (onlineUsers.has(userId)) {
@@ -206,7 +214,7 @@ function setupSocket(server) {
                         { isOnline: false, lastSeen: new Date() }
                     );
                 } catch (err) {
-                    console.warn('⚠️ [Socket] Could not update user status:', err.message);
+                    logger.warn('⚠️ [Socket] Could not update user status:', err.message);
                 }
             }
         });
