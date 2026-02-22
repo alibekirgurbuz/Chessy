@@ -1,13 +1,13 @@
 # Premove Latency Report
 
-**Generated:** 2026-02-22T10:42:57.858Z
+**Generated:** 2026-02-22T11:55:31.018Z
 
 ## Summary
 
 | Metric | Value |
 |--------|-------|
-| Total traces | 17 |
-| Executed | 17 |
+| Total traces | 30 |
+| Executed | 0 |
 | Rejected | 0 |
 | Reject rate | 0% |
 
@@ -15,17 +15,16 @@
 
 | Metric | Count | p50 | p95 | p99 | Min | Max | Avg |
 |--------|-------|-----|-----|-----|-----|-----|-----|
-| Turn flip → Found queued | 17 | 0ms | 1ms | 1ms | 0ms | 1ms | 0.118ms |
-| Turn flip → Execute start | 17 | 0ms | 1ms | 1ms | 0ms | 1ms | 0.294ms |
-| Turn flip → Execute end | 17 | 1ms | 2ms | 2ms | 0ms | 2ms | 1.059ms |
-| Execute duration | 17 | 1ms | 1ms | 1ms | 0ms | 1ms | 0.765ms |
-| Execute end → Broadcast | 17 | 177ms | 348ms | 348ms | 163ms | 348ms | 196.294ms |
-| Turn flip → Broadcast (E2E) | 17 | 178ms | 349ms | 349ms | 164ms | 349ms | 197.353ms |
+| Turn flip → Found queued | 0 | - | - | - | - | - | - |
+| Turn flip → Execute start | 0 | - | - | - | - | - | - |
+| Turn flip → Execute end | 0 | - | - | - | - | - | - |
+| Execute duration | 0 | - | - | - | - | - | - |
+| Execute end → Broadcast | 0 | - | - | - | - | - | - |
+| Turn flip → Broadcast (E2E) | 0 | - | - | - | - | - | - |
 
 ## Pass/Fail Criteria
 
-- `flip_to_execute_end_ms` p95: **2ms** ✅ PASS (<10ms)
-- `flip_to_broadcast_ms` p95: **349ms**
+- `flip_to_execute_end_ms` p95: **No data**
 
 ## Verdict
 

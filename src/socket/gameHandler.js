@@ -24,6 +24,7 @@ function gameHandler(io, socket, onlineUsers) {
         trace.mark('turn_flipped');
 
         const queuedPremove = premoveManager.getPremove(gameId, premoveColor);
+        logger.debug('[PREMOVE_DIAG] execute_premove_lookup', { gameId, premoveColor, hasQueuedPremove: !!queuedPremove });
         if (!queuedPremove) return;
 
         // ── TRACE: queued_premove_found ──
@@ -487,6 +488,7 @@ function gameHandler(io, socket, onlineUsers) {
 
     // ==================== SET PREMOVE ====================
     socket.on('set_premove', async ({ gameId, premove }) => {
+        logger.debug('[PREMOVE_DIAG] set_premove_received', { gameId, socketId: socket.id, userId: socket.userId, premove });
         await premoveManager.withLock(gameId, async () => {
             try {
                 const game = await Game.findById(gameId);
@@ -515,7 +517,9 @@ function gameHandler(io, socket, onlineUsers) {
                     chess.loadPgn(game.pgn);
                 }
                 const currentTurnColor = chess.turn() === 'w' ? 'white' : 'black';
+                logger.debug('[PREMOVE_DIAG] set_premove_turn_check', { gameId, playerColor, currentTurnColor, isPlayersTurn: currentTurnColor === playerColor });
                 if (currentTurnColor === playerColor) {
+                    logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, playerColor, reason: 'It is your turn' });
                     return socket.emit('premove_rejected', {
                         gameId,
                         reason: 'It is your turn — make a normal move'
@@ -524,6 +528,7 @@ function gameHandler(io, socket, onlineUsers) {
 
                 // Validate premove data
                 if (!premove || !premove.from || !premove.to) {
+                    logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, playerColor, reason: 'Invalid premove data' });
                     return socket.emit('premove_rejected', {
                         gameId,
                         reason: 'Invalid premove data'
@@ -543,6 +548,7 @@ function gameHandler(io, socket, onlineUsers) {
                     promotion: premove.promotion || null
                 };
                 await game.save();
+                logger.debug('[PREMOVE_DIAG] set_premove_stored', { gameId, playerColor, premove: { from: premove.from, to: premove.to, promotion: premove.promotion }, persisted: true });
 
                 // Notify room
                 io.to(gameId).emit('premove_set', {

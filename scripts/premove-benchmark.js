@@ -12,6 +12,9 @@
  *
  * Or from a file:
  *   node scripts/premove-benchmark.js --logfile /tmp/server.log
+ *
+ * Example with Render production log:
+ *   node scripts/premove-benchmark.js --logfile /path/to/render.log
  */
 
 const fs = require('fs');
@@ -67,6 +70,59 @@ function parseLogs(lines) {
     }
 
     return { traces, summaries };
+}
+
+// ——— Trace → Synthetic Summary (fallback when no premove_summary exists) ———
+function buildSummariesFromTraces(traces) {
+    const synthetics = [];
+
+    for (const [traceId, { events }] of traces) {
+        // Build event-type → first matching event lookup
+        const byEvent = {};
+        for (const ev of events) {
+            if (!byEvent[ev.event]) byEvent[ev.event] = ev;
+        }
+
+        const flip = byEvent['turn_flipped'];
+        const found = byEvent['queued_premove_found'];
+        const execStart = byEvent['premove_execute_start'];
+        const execEnd = byEvent['premove_execute_end'];
+        const broadcast = byEvent['move_broadcast_sent'];
+        const rejected = byEvent['premove_rejected'];
+
+        // Determine outcome
+        let outcome;
+        if (rejected) {
+            outcome = 'rejected';
+        } else if (execEnd) {
+            outcome = 'executed';
+        } else {
+            outcome = 'partial';
+        }
+
+        // Compute latencies (null if required event is missing)
+        const flipTs = flip ? flip.ts : null;
+        const latencies = {
+            flip_to_found_ms: (flipTs != null && found) ? found.ts - flipTs : null,
+            flip_to_execute_start_ms: (flipTs != null && execStart) ? execStart.ts - flipTs : null,
+            flip_to_execute_end_ms: (flipTs != null && execEnd) ? execEnd.ts - flipTs : null,
+            execute_duration_ms: (execStart && execEnd) ? execEnd.ts - execStart.ts : null,
+            execute_to_broadcast_ms: (execEnd && broadcast) ? broadcast.ts - execEnd.ts : null,
+            flip_to_broadcast_ms: (flipTs != null && broadcast) ? broadcast.ts - flipTs : null,
+        };
+
+        synthetics.push({
+            _type: 'premove_summary_synthetic',
+            traceId,
+            outcome,
+            latencies,
+            gameId: flip ? flip.gameId : (events[0] || {}).gameId || null,
+            moveNo: flip ? flip.moveNo : null,
+            eventCount: events.length,
+        });
+    }
+
+    return synthetics;
 }
 
 // ——— Stats ———
@@ -209,11 +265,18 @@ async function main() {
     const lines = await readLines(source);
     console.error(`   Read ${lines.length} lines`);
 
-    const { summaries } = parseLogs(lines);
-    console.error(`   Found ${summaries.length} premove traces`);
+    let { traces, summaries } = parseLogs(lines);
+    console.error(`   Found ${summaries.length} premove summaries, ${traces.size} trace groups`);
+
+    // Fallback: build synthetic summaries from individual trace events
+    if (summaries.length === 0 && traces.size > 0) {
+        console.error('   ℹ️  No premove_summary found, building metrics from trace events...');
+        summaries = buildSummariesFromTraces(traces);
+        console.error(`   Found ${summaries.length} premove traces (from trace events)`);
+    }
 
     if (summaries.length === 0) {
-        console.error('   ⚠️  No premove traces found. Play some games with premoves first!');
+        console.error('   ⚠️  No premove data found. Play some games with premoves first!');
         process.exit(0);
     }
 
