@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const gameController = require('../controllers/gameController');
+const { clerkAuthMiddleware, authRequired } = require('../middleware/clerkAuth');
+
+// Apply Clerk middleware to all game routes
+router.use(clerkAuthMiddleware);
 
 // Oyun oluştur
 router.post('/create', gameController.createGame);
@@ -8,8 +12,8 @@ router.post('/create', gameController.createGame);
 // Belirli oyunu getir
 router.get('/:gameId', gameController.getGame);
 
-// Kullanıcının oyunlarını getir
-router.get('/user/:userId', gameController.getUserGames);
+// Kullanıcının oyunlarını getir (auth + owner check required)
+router.get('/user/:userId', authRequired, gameController.getUserGames);
 
 // Hamle yap
 router.put('/:gameId/move', gameController.makeMove);

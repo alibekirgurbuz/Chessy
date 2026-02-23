@@ -9,6 +9,7 @@ const webhookRoutes = require('./routes/webhooks');
 const authRoutes = require('./routes/auth');
 const gameRoutes = require('./routes/games');
 const matchmakingRoutes = require('./routes/matchmaking');
+const profileRoutes = require('./routes/profile');
 const errorHandler = require('./middleware/errorHandler');
 const setupSocket = require('./socket');
 const TimeoutChecker = require('./services/TimeoutChecker');
@@ -41,6 +42,7 @@ app.use('/api/webhooks', webhookRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/games', gameRoutes);
 app.use('/api/matchmaking', matchmakingRoutes);
+app.use('/api/profile', profileRoutes);
 
 // Error handler (must be last)
 app.use(errorHandler);

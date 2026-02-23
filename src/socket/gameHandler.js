@@ -4,6 +4,7 @@ const ClockManager = require('../services/ClockManager');
 const premoveManager = require('../services/PremoveManager');
 const PremoveTracer = require('../services/PremoveTracer');
 const logger = require('../utils/logger');
+const { applyGameStats } = require('../services/StatsService');
 
 function gameHandler(io, socket, onlineUsers) {
     // ——— Helper: determine player color ('white'|'black') from socket.userId ———
@@ -100,6 +101,7 @@ function gameHandler(io, socket, onlineUsers) {
                         trace.mark('premove_db_persist_end');
 
                         premoveManager.clearAll(gameId, 'game_over');
+                        applyGameStats(gameId);
 
                         trace.mark('premove_execute_end', { outcome: 'timeout' });
                         trace.summary();
@@ -208,6 +210,7 @@ function gameHandler(io, socket, onlineUsers) {
                     reason: chess.isCheckmate() ? 'checkmate' : 'draw'
                 });
                 premoveManager.clearAll(gameId, 'game_over');
+                applyGameStats(gameId);
             }
 
             trace.mark('premove_broadcast_end');
@@ -283,8 +286,7 @@ function gameHandler(io, socket, onlineUsers) {
     // ==================== JOIN GAME ====================
     socket.on('join_game', async ({ gameId }) => {
         try {
-            const game = await Game.findById(gameId)
-                .populate('whitePlayer blackPlayer');
+            const game = await Game.findById(gameId);
 
             if (!game) {
                 return socket.emit('error', { message: 'Game not found' });
@@ -464,6 +466,7 @@ function gameHandler(io, socket, onlineUsers) {
                             });
                             io.to(gameId).emit('clock_update', clockState);
                             premoveManager.clearAll(gameId, 'game_over');
+                            applyGameStats(gameId);
                             return;
                         }
 
@@ -521,6 +524,7 @@ function gameHandler(io, socket, onlineUsers) {
                         reason: chess.isCheckmate() ? 'checkmate' : 'draw'
                     });
                     premoveManager.clearAll(gameId, 'game_over');
+                    applyGameStats(gameId);
                 }
 
                 logger.debug(`Move made in game ${gameId}: ${moveResult.san}`);
@@ -719,6 +723,7 @@ function gameHandler(io, socket, onlineUsers) {
 
             // Clear premoves
             premoveManager.clearAll(gameId, 'game_over');
+            applyGameStats(gameId);
 
             io.to(gameId).emit('game_over', {
                 gameId,

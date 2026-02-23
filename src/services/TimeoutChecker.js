@@ -4,6 +4,7 @@
 
 const Game = require('../models/Game');
 const ClockManager = require('./ClockManager');
+const { applyGameStats } = require('./StatsService');
 
 class TimeoutChecker {
     constructor(io) {
@@ -130,6 +131,7 @@ class TimeoutChecker {
             freshGame.resultReason = 'timeout';
             freshGame.updatedAt = Date.now();
             await freshGame.save();
+            await applyGameStats(freshGame._id);
 
             // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {
@@ -165,6 +167,7 @@ class TimeoutChecker {
 
             freshGame.updatedAt = Date.now();
             await freshGame.save();
+            await applyGameStats(freshGame._id);
 
             // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {

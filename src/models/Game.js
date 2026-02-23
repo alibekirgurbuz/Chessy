@@ -108,6 +108,11 @@ const gameSchema = new mongoose.Schema(
         sourceMoveNo: { type: Number, default: null },
       },
     },
+    // Idempotency flag: true after User.wins/losses/draws have been updated
+    statsApplied: {
+      type: Boolean,
+      default: false,
+    },
   },
   {
     timestamps: true,

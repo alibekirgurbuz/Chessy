@@ -3,6 +3,61 @@ const User = require('../models/User');
 const { Chess } = require('chess.js');
 const mongoose = require('mongoose');
 
+// ──────────────────────────────────────────────
+// Helper: Enrich games with player info via manual User lookup
+// (Game.whitePlayer/blackPlayer are Clerk ID strings, not ObjectId refs,
+//  so populate() does NOT work. We resolve player details manually.)
+// ──────────────────────────────────────────────
+async function enrichGamesWithPlayerInfo(games) {
+  // Collect unique Clerk IDs from all games
+  const clerkIds = new Set();
+  for (const g of games) {
+    if (g.whitePlayer) clerkIds.add(g.whitePlayer.toString());
+    if (g.blackPlayer) clerkIds.add(g.blackPlayer.toString());
+  }
+
+  if (clerkIds.size === 0) return games;
+
+  // Single DB query for all unique players
+  const users = await User.find(
+    { clerkId: { $in: [...clerkIds] } },
+    'clerkId email firstName lastName username imageUrl'
+  );
+
+  // Build lookup map: clerkId → user info
+  const userMap = {};
+  for (const u of users) {
+    userMap[u.clerkId] = {
+      _id: u._id,
+      clerkId: u.clerkId,
+      email: u.email,
+      firstName: u.firstName,
+      lastName: u.lastName,
+      username: u.username,
+      imageUrl: u.imageUrl,
+      displayName: u.displayName, // virtual
+    };
+  }
+
+  // Enrich each game
+  return games.map((g) => {
+    const gameObj = g.toObject ? g.toObject() : { ...g };
+    const whiteId = gameObj.whitePlayer?.toString();
+    const blackId = gameObj.blackPlayer?.toString();
+
+    gameObj.whitePlayer = userMap[whiteId] || { clerkId: whiteId, username: 'Unknown' };
+    gameObj.blackPlayer = userMap[blackId] || { clerkId: blackId, username: 'Unknown' };
+
+    return gameObj;
+  });
+}
+
+// Helper: Enrich a single game
+async function enrichGameWithPlayerInfo(game) {
+  const enriched = await enrichGamesWithPlayerInfo([game]);
+  return enriched[0];
+}
+
 // Oyun oluştur
 const createGame = async (req, res) => {
   try {
@@ -72,15 +127,14 @@ const getGame = async (req, res) => {
       return res.status(400).json({ error: 'Invalid game ID' });
     }
 
-    const game = await Game.findById(gameId)
-      .populate('whitePlayer', 'email firstName lastName')
-      .populate('blackPlayer', 'email firstName lastName');
+    const game = await Game.findById(gameId);
 
     if (!game) {
       return res.status(404).json({ error: 'Game not found' });
     }
 
-    res.json(game);
+    const enrichedGame = await enrichGameWithPlayerInfo(game);
+    res.json(enrichedGame);
   } catch (error) {
     console.error('Error getting game:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
@@ -88,39 +142,48 @@ const getGame = async (req, res) => {
 };
 
 // Kullanıcının oyunlarını listele
+// userId param = Clerk ID (string), NOT MongoDB ObjectId
 const getUserGames = async (req, res) => {
   try {
     const { userId } = req.params;
     const { status } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
+    if (!userId || typeof userId !== 'string' || userId.trim() === '') {
       return res.status(400).json({ error: 'Invalid user ID' });
     }
 
-    // Kullanıcının var olup olmadığını kontrol et
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+    // Owner check: authenticated user can only access their own games
+    const { getAuth } = require('../middleware/clerkAuth');
+    const auth = getAuth(req);
+    const authenticatedClerkId = auth?.userId;
+
+    if (!authenticatedClerkId) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Query oluştur - hem whitePlayer hem blackPlayer olabilir
+    if (authenticatedClerkId !== userId) {
+      return res.status(403).json({ error: 'Forbidden: You can only access your own games' });
+    }
+
+    // Query — whitePlayer/blackPlayer store Clerk ID strings
     const query = {
       $or: [{ whitePlayer: userId }, { blackPlayer: userId }],
     };
 
-    // Status filter'ı varsa ekle
+    // Status filter
     if (status && ['ongoing', 'completed', 'abandoned'].includes(status)) {
       query.status = status;
     }
 
     const games = await Game.find(query)
-      .populate('whitePlayer', 'email firstName lastName')
-      .populate('blackPlayer', 'email firstName lastName')
       .sort({ createdAt: -1 }); // En yeni en üstte
 
+    // Enrich with player info via manual lookup
+    const enrichedGames = await enrichGamesWithPlayerInfo(games);
+
     res.json({
-      games,
-      total: games.length,
+      games: enrichedGames,
+      total: enrichedGames.length,
     });
   } catch (error) {
     console.error('Error getting user games:', error);
@@ -215,12 +278,11 @@ const makeMove = async (req, res) => {
     game.updatedAt = new Date();
     await game.save();
 
-    // Populate edilmiş oyunu döndür
-    const updatedGame = await Game.findById(gameId)
-      .populate('whitePlayer', 'email firstName lastName')
-      .populate('blackPlayer', 'email firstName lastName');
+    // Enriched oyunu döndür
+    const updatedGame = await Game.findById(gameId);
+    const enrichedGame = await enrichGameWithPlayerInfo(updatedGame);
 
-    res.json(updatedGame);
+    res.json(enrichedGame);
   } catch (error) {
     console.error('Error making move:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
@@ -293,12 +355,11 @@ const resignGame = async (req, res) => {
 
     await game.save();
 
-    // Populate edilmiş oyunu döndür
-    const updatedGame = await Game.findById(gameId)
-      .populate('whitePlayer', 'email firstName lastName')
-      .populate('blackPlayer', 'email firstName lastName');
+    // Enriched oyunu döndür
+    const updatedGame = await Game.findById(gameId);
+    const enrichedGame = await enrichGameWithPlayerInfo(updatedGame);
 
-    res.json(updatedGame);
+    res.json(enrichedGame);
   } catch (error) {
     console.error('Error resigning game:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
