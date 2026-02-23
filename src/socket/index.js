@@ -11,6 +11,8 @@ const mongoose = require('mongoose');
 
 const logger = require('../utils/logger');
 
+const { createAdapter } = require('@socket.io/redis-adapter');
+
 // Clear stale online users on server startup
 async function clearOnlineUsersOnStartup() {
     try {
@@ -36,6 +38,9 @@ async function clearOnlineUsersOnStartup() {
 clearOnlineUsersOnStartup();
 
 function setupSocket(server) {
+    const pubClient = redis.createClient();
+    const subClient = pubClient.duplicate();
+
     const io = new Server(server, {
         cors: {
             origin: '*', // Development için tüm origin'lere izin ver
@@ -49,6 +54,7 @@ function setupSocket(server) {
         // Ping tuning for mobile stability
         pingInterval: 25000, // 25s ping interval
         pingTimeout: 60000,  // 60s timeout - slow networks için
+        adapter: createAdapter(pubClient, subClient)
     });
 
     // Middleware: Socket authentication with Clerk JWT support
@@ -98,21 +104,18 @@ function setupSocket(server) {
         return next(new Error('Authentication error: userId or token required'));
     });
 
-    // Track online users as Maps of Sets to handle multiple tabs
-    const onlineUsers = new Map(); // Map<userId, Set<socketId>>
+
 
     // Connection handler
     io.on('connection', (socket) => {
         const userId = socket.userId;
         const authType = socket.isClerkUser ? 'Clerk' : 'Legacy';
 
-        logger.debug(`✅ User connected: ${userId} (${authType})`);
+        // Join a personal room to allow cross-node targeted messages
+        socket.join(userId);
 
-        // Track online user
-        if (!onlineUsers.has(userId)) {
-            onlineUsers.set(userId, new Set());
-        }
-        onlineUsers.get(userId).add(socket.id);
+        logger.info(`✅ User connected: ${userId} (${authType}) | Socket: ${socket.id}`);
+
         broadcastOnlineCount();
 
         // Handle user_online event
@@ -130,7 +133,7 @@ function setupSocket(server) {
         });
 
         // Game events
-        gameHandler(io, socket, onlineUsers);
+        gameHandler(io, socket);
 
         // Matchmaking events
         matchmakingHandler(io, socket);
@@ -147,18 +150,9 @@ function setupSocket(server) {
             for (const room of socket.rooms) {
                 if (room !== socket.id) {
                     // It's likely a game room or other room.
-                    // Check if this is the last socket for this user in this room
-                    const userSockets = onlineUsers.get(userId) || new Set();
-                    let hasOtherSocketsInRoom = false;
-                    for (const sId of userSockets) {
-                        if (sId !== socket.id) {
-                            const otherSocket = io.sockets.sockets.get(sId);
-                            if (otherSocket && otherSocket.rooms.has(room)) {
-                                hasOtherSocketsInRoom = true;
-                                break;
-                            }
-                        }
-                    }
+                    // Check if this is the last socket for this user in this room across instances
+                    const socketsInRoom = await io.in(room).fetchSockets();
+                    const hasOtherSocketsInRoom = socketsInRoom.some(s => s.userId === userId && s.id !== socket.id);
 
                     if (!hasOtherSocketsInRoom) {
                         // This user is fully disconnecting from this room
@@ -177,7 +171,7 @@ function setupSocket(server) {
                                             playerId: userId,
                                             reconnectDeadlineAt: deadline
                                         });
-                                        console.log(`[Socket] User ${userId} disconnected from game ${room}, starting 20s grace period`);
+                                        logger.info(`[Socket] User ${userId} disconnected from game ${room}, starting 20s grace period | Socket: ${socket.id}`);
                                         continue;
                                     }
                                 }
@@ -195,24 +189,21 @@ function setupSocket(server) {
 
         // Disconnect
         socket.on('disconnect', async () => {
-            logger.debug(`❌ User disconnected: ${userId} (${authType})`);
+            logger.info(`❌ User disconnected: ${userId} (${authType}) | Socket: ${socket.id}`);
 
-            // Remove from online users
-            if (onlineUsers.has(userId)) {
-                onlineUsers.get(userId).delete(socket.id);
-                if (onlineUsers.get(userId).size === 0) {
-                    onlineUsers.delete(userId);
-                }
-            }
             broadcastOnlineCount();
 
             // Update database for Clerk users
             if (socket.isClerkUser) {
                 try {
-                    await User.findOneAndUpdate(
-                        { clerkId: userId },
-                        { isOnline: false, lastSeen: new Date() }
-                    );
+                    // Check if they still have other active connections
+                    const userSockets = await io.in(userId).fetchSockets();
+                    if (userSockets.length === 0) {
+                        await User.findOneAndUpdate(
+                            { clerkId: userId },
+                            { isOnline: false, lastSeen: new Date() }
+                        );
+                    }
                 } catch (err) {
                     logger.warn('⚠️ [Socket] Could not update user status:', err.message);
                 }
@@ -221,8 +212,18 @@ function setupSocket(server) {
     });
 
     // Broadcast online count to all clients
-    function broadcastOnlineCount() {
-        io.emit('online_count', { count: onlineUsers.size });
+    async function broadcastOnlineCount() {
+        try {
+            // Because each user joins a room named exactly their `userId`
+            // and we're looking for unique users, we might need an adapter supported 
+            // way. For now, since `onlineUsers` is local, we'll use `io.sockets.sockets.size`
+            // Wait, fetchSockets fetches all sockets across the cluster
+            const sockets = await io.fetchSockets();
+            const uniqueUsers = new Set(sockets.map(s => s.userId));
+            io.emit('online_count', { count: uniqueUsers.size });
+        } catch (e) {
+            console.error(e);
+        }
     }
 
     return io;

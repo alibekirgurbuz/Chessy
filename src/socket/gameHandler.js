@@ -6,7 +6,7 @@ const PremoveTracer = require('../services/PremoveTracer');
 const logger = require('../utils/logger');
 const { applyGameStats } = require('../services/StatsService');
 
-function gameHandler(io, socket, onlineUsers) {
+function gameHandler(io, socket) {
     // ——— Helper: determine player color ('white'|'black') from socket.userId ———
     function getPlayerColor(game) {
         if (game.whitePlayer.toString() === socket.userId) return 'white';
@@ -24,7 +24,7 @@ function gameHandler(io, socket, onlineUsers) {
         const trace = PremoveTracer.start(gameId, premoveColor, chess.history().length);
         trace.mark('turn_flipped');
 
-        const queuedPremove = premoveManager.getPremove(gameId, premoveColor);
+        const queuedPremove = premoveManager.getPremove(game, premoveColor);
         logger.debug('[PREMOVE_DIAG] execute_premove_lookup', {
             gameId, premoveColor, hasQueuedPremove: !!queuedPremove,
             setAt: queuedPremove ? queuedPremove.setAt : null,
@@ -118,13 +118,10 @@ function gameHandler(io, socket, onlineUsers) {
                     const premovePlayerId = premoveColor === 'white'
                         ? game.whitePlayer.toString()
                         : game.blackPlayer.toString();
-                    const premoveSocket = findSocketByUserId(premovePlayerId);
-                    if (premoveSocket) {
-                        premoveSocket.emit('premove_rejected', {
-                            gameId,
-                            reason: clockError.message
-                        });
-                    }
+                    io.to(premovePlayerId).emit('premove_rejected', {
+                        gameId,
+                        reason: clockError.message
+                    });
                     io.to(gameId).emit('premove_cleared', {
                         gameId,
                         by: premoveColor,
@@ -251,13 +248,10 @@ function gameHandler(io, socket, onlineUsers) {
             const premovePlayerId = premoveColor === 'white'
                 ? game.whitePlayer.toString()
                 : game.blackPlayer.toString();
-            const premoveSocket = findSocketByUserId(premovePlayerId);
-            if (premoveSocket) {
-                premoveSocket.emit('premove_rejected', {
-                    gameId,
-                    reason: e.message || 'Invalid premove'
-                });
-            }
+            io.to(premovePlayerId).emit('premove_rejected', {
+                gameId,
+                reason: e.message || 'Invalid premove'
+            });
 
             io.to(gameId).emit('premove_cleared', {
                 gameId,
@@ -276,12 +270,7 @@ function gameHandler(io, socket, onlineUsers) {
         }
     }
 
-    // ——— Helper: find socket by userId ———
-    function findSocketByUserId(userId) {
-        const socketId = onlineUsers.get(userId);
-        if (!socketId) return null;
-        return io.sockets.sockets.get(socketId) || null;
-    }
+
 
     // ==================== JOIN GAME ====================
     socket.on('join_game', async ({ gameId }) => {
@@ -348,18 +337,21 @@ function gameHandler(io, socket, onlineUsers) {
                 return id.startsWith('guest_') ? 'Misafir Oyuncu' : 'Oyuncu';
             };
 
+            const isWhiteSocketOnline = (await io.in(whiteId).fetchSockets()).length > 0;
+            const isBlackSocketOnline = (await io.in(blackId).fetchSockets()).length > 0;
+
             const whitePlayerInfo = {
                 _id: whiteId,
                 username: getDisplayName(whiteUser, whiteId),
                 isGuest: whiteId.startsWith('guest_'),
-                isOnline: (whiteUser && whiteUser.isOnline) || (onlineUsers && onlineUsers.has(whiteId)) || false
+                isOnline: (whiteUser && whiteUser.isOnline) || isWhiteSocketOnline || false
             };
 
             const blackPlayerInfo = {
                 _id: blackId,
                 username: getDisplayName(blackUser, blackId),
                 isGuest: blackId.startsWith('guest_'),
-                isOnline: (blackUser && blackUser.isOnline) || (onlineUsers && onlineUsers.has(blackId)) || false
+                isOnline: (blackUser && blackUser.isOnline) || isBlackSocketOnline || false
             };
 
             // Mevcut oyun durumunu gönder
@@ -386,7 +378,7 @@ function gameHandler(io, socket, onlineUsers) {
                 premoveManager.rehydrate(gameId, game.queuedPremoves);
             }
 
-            logger.debug(`User ${socket.userId} joined game ${gameId}, FEN: ${chess.fen()}`);
+            logger.info(`🎮 User ${socket.userId} joined game ${gameId} | Socket: ${socket.id} | FEN: ${chess.fen()}`);
 
         } catch (error) {
             console.error('join_game error:', error);
@@ -428,12 +420,15 @@ function gameHandler(io, socket, onlineUsers) {
 
                 const moveResult = chess.move(move);
                 if (!moveResult) {
+                    logger.warn(`🚫 Invalid move attempt by ${socket.userId} in ${gameId} | Move: ${JSON.stringify(move)} | Socket: ${socket.id}`);
                     return socket.emit('error', { message: 'Invalid move' });
                 }
 
+                logger.info(`♟️ Move made: ${moveResult.san} by ${socket.userId} in ${gameId} | Socket: ${socket.id}`);
+
                 // Clear the mover's own premove if they had one (they played a normal move instead)
                 const moverColor = isWhitePlayer ? 'white' : 'black';
-                if (premoveManager.getPremove(gameId, moverColor)) {
+                if (premoveManager.getPremove(game, moverColor)) {
                     premoveManager.clearPremove(gameId, moverColor, 'normal_move_override');
                     game.queuedPremoves[moverColor] = null;
                     io.to(gameId).emit('premove_cleared', {

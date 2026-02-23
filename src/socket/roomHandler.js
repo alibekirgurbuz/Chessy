@@ -1,10 +1,12 @@
 const { v4: uuidv4 } = require('uuid');
+const redis = require('../services/redisClient');
 const Game = require('../models/Game');
 const { Chess } = require('chess.js');
 const ClockManager = require('../services/ClockManager');
 
-// In-memory room storage for waiting rooms
-const waitingRooms = new Map();
+// Redis-backed room storage for waiting rooms
+const ROOM_PREFIX = `${redis.appPrefix}room:waiting:`;
+const USER_ROOM_PREFIX = `${redis.appPrefix}room:user:`; // Track which room a creator has active
 
 /**
  * Room Handler - Manages private game rooms for friend invites
@@ -51,8 +53,9 @@ function roomHandler(io, socket) {
                 players: [userId]
             };
 
-            // Store in waiting rooms
-            waitingRooms.set(roomId, roomData);
+            // Store in Redis (1 hour expiration)
+            await redis.set(`${ROOM_PREFIX}${roomId}`, JSON.stringify(roomData), 'EX', 3600);
+            await redis.set(`${USER_ROOM_PREFIX}${userId}`, roomId, 'EX', 3600);
 
             // Join socket room
             socket.join(`room:${roomId}`);
@@ -95,8 +98,14 @@ function roomHandler(io, socket) {
                 return;
             }
 
-            // Check if room exists
-            const room = waitingRooms.get(roomId);
+            // Check if room exists in Redis
+            const roomDataRaw = await redis.get(`${ROOM_PREFIX}${roomId}`);
+            if (!roomDataRaw) {
+                console.log('   ❌ Room not found in Redis:', roomId);
+                socket.emit('room_error', { message: 'Oda bulunamadı veya süresi doldu' });
+                return;
+            }
+            const room = JSON.parse(roomDataRaw);
 
             if (!room) {
                 console.log('   ❌ Room not found:', roomId);
@@ -199,8 +208,9 @@ function roomHandler(io, socket) {
                 yourColor: isCreatorWhite ? 'black' : 'white'
             });
 
-            // Remove from waiting rooms (game is now active)
-            waitingRooms.delete(roomId);
+            // Remove from Redis (game is now active)
+            await redis.del(`${ROOM_PREFIX}${roomId}`);
+            await redis.del(`${USER_ROOM_PREFIX}${room.creatorId}`);
 
             console.log('   ✅ Game started!');
             console.log('==================================');
@@ -221,12 +231,14 @@ function roomHandler(io, socket) {
             console.log('   👤 User:', userId);
             console.log('   🏠 Room:', roomId);
 
-            const room = waitingRooms.get(roomId);
+            const roomDataRaw = await redis.get(`${ROOM_PREFIX}${roomId}`);
+            const room = roomDataRaw ? JSON.parse(roomDataRaw) : null;
 
             if (room) {
                 // If creator leaves waiting room, delete it
                 if (room.creatorId === userId && room.status === 'waiting') {
-                    waitingRooms.delete(roomId);
+                    await redis.del(`${ROOM_PREFIX}${roomId}`);
+                    await redis.del(`${USER_ROOM_PREFIX}${userId}`);
                     console.log('   ✅ Room deleted (creator left)');
                 }
             }
@@ -246,7 +258,8 @@ function roomHandler(io, socket) {
     socket.on('get_room_info', async (data) => {
         try {
             const { roomId } = data;
-            const room = waitingRooms.get(roomId);
+            const roomDataRaw = await redis.get(`${ROOM_PREFIX}${roomId}`);
+            const room = roomDataRaw ? JSON.parse(roomDataRaw) : null;
 
             if (!room) {
                 // Check if game exists in DB
@@ -276,32 +289,23 @@ function roomHandler(io, socket) {
     });
 
     // Handle disconnect - cleanup waiting rooms
-    socket.on('disconnect', () => {
-        // Find and clean up any waiting rooms created by this user
-        for (const [roomId, room] of waitingRooms.entries()) {
-            if (room.creatorSocketId === socket.id && room.status === 'waiting') {
-                waitingRooms.delete(roomId);
-                console.log(`🧹 [RoomHandler] Cleaned up room ${roomId} (creator disconnected)`);
+    socket.on('disconnect', async () => {
+        try {
+            // Check if this user was a creator of a waiting room
+            const roomId = await redis.get(`${USER_ROOM_PREFIX}${userId}`);
+            if (roomId) {
+                // Check if they have ANY other sockets in the cluster before deleting the room
+                const userSockets = await io.in(userId).fetchSockets();
+                if (userSockets.length === 0) {
+                    await redis.del(`${ROOM_PREFIX}${roomId}`);
+                    await redis.del(`${USER_ROOM_PREFIX}${userId}`);
+                    console.log(`🧹 [RoomHandler] Cleaned up room ${roomId} (creator fully disconnected)`);
+                }
             }
+        } catch (e) {
+            console.error('Room disconnect cleanup error:', e);
         }
     });
 }
-
-// Room cleanup interval (every 10 minutes, clean rooms older than 1 hour)
-setInterval(() => {
-    const oneHourAgo = Date.now() - (60 * 60 * 1000);
-    let cleaned = 0;
-
-    for (const [roomId, room] of waitingRooms.entries()) {
-        if (room.createdAt < oneHourAgo) {
-            waitingRooms.delete(roomId);
-            cleaned++;
-        }
-    }
-
-    if (cleaned > 0) {
-        console.log(`🧹 [RoomHandler] Cleaned ${cleaned} expired rooms`);
-    }
-}, 10 * 60 * 1000); // Every 10 minutes
 
 module.exports = roomHandler;
