@@ -443,6 +443,8 @@ function gameHandler(io, socket, onlineUsers) {
                     });
                 }
 
+                logger.info(`[DEBUG] About to enter clock logic. gameId=${gameId}, moveResult=${moveResult.san}`);
+
                 // ========== CLOCK LOGIC START ==========
                 let clockState = null;
                 if (game.clock) {
@@ -482,11 +484,13 @@ function gameHandler(io, socket, onlineUsers) {
                         game.clock = clock.toJSON();
 
                     } catch (clockError) {
-                        console.error('Clock error:', clockError);
+                        console.error('[DEBUG] Clock error in make_move!!!', clockError);
                         return socket.emit('error', { message: clockError.message });
                     }
                 }
                 // ========== CLOCK LOGIC END ==========
+
+                logger.info(`[DEBUG] Clock logic passed! Updating PGN and status...`);
 
                 // PGN'i güncelle
                 const updatedPgn = chess.pgn();
