@@ -326,30 +326,39 @@ function gameHandler(io, socket, onlineUsers) {
             const whiteId = game.whitePlayer.toString();
             const blackId = game.blackPlayer.toString();
 
-            // Only query DB for valid ObjectIds (registered users)
-            const userIdsToFetch = [whiteId, blackId].filter(id => mongoose.Types.ObjectId.isValid(id));
+            // Only query DB for registered users (i.e. those not starting with 'guest_')
+            const userIdsToFetch = [whiteId, blackId].filter(id => !id.startsWith('guest_'));
 
             let players = [];
             if (userIdsToFetch.length > 0) {
                 try {
-                    players = await User.find({ _id: { $in: userIdsToFetch } });
+                    players = await User.find({ clerkId: { $in: userIdsToFetch } });
                 } catch (err) {
                     console.error('Error fetching users in join_game:', err);
                 }
             }
 
-            const whiteUser = players.find(p => p._id.toString() === whiteId);
-            const blackUser = players.find(p => p._id.toString() === blackId);
+            const whiteUser = players.find(p => p.clerkId === whiteId);
+            const blackUser = players.find(p => p.clerkId === blackId);
+
+            const getDisplayName = (user, id) => {
+                if (user) {
+                    return user.username || user.firstName || user.displayName || 'Oyuncu';
+                }
+                return id.startsWith('guest_') ? 'Misafir Oyuncu' : 'Oyuncu';
+            };
 
             const whitePlayerInfo = {
                 _id: whiteId,
-                username: whiteUser ? whiteUser.username : (whiteId.startsWith('user_') ? 'Misafir Oyuncu' : 'Unknown'),
+                username: getDisplayName(whiteUser, whiteId),
+                isGuest: whiteId.startsWith('guest_'),
                 isOnline: (whiteUser && whiteUser.isOnline) || (onlineUsers && onlineUsers.has(whiteId)) || false
             };
 
             const blackPlayerInfo = {
                 _id: blackId,
-                username: blackUser ? blackUser.username : (blackId.startsWith('user_') ? 'Misafir Oyuncu' : 'Unknown'),
+                username: getDisplayName(blackUser, blackId),
+                isGuest: blackId.startsWith('guest_'),
                 isOnline: (blackUser && blackUser.isOnline) || (onlineUsers && onlineUsers.has(blackId)) || false
             };
 

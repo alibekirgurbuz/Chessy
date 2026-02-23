@@ -83,13 +83,18 @@ function matchmakingHandler(io, socket) {
                     const whiteUser = playerMap[whitePlayerId];
                     const blackUser = playerMap[blackPlayerId];
 
-                    const whiteUsername = whiteUser ? (whiteUser.username || whiteUser.firstName || 'Anonymous') : whitePlayerId;
-                    const blackUsername = blackUser ? (blackUser.username || blackUser.firstName || 'Anonymous') : blackPlayerId;
+                    const getDisplayName = (user, id) => {
+                        if (user) return user.username || user.firstName || user.displayName || 'Oyuncu';
+                        return id.startsWith('guest_') ? 'Misafir Oyuncu' : 'Oyuncu';
+                    };
+
+                    const whiteUsername = getDisplayName(whiteUser, whitePlayerId);
+                    const blackUsername = getDisplayName(blackUser, blackPlayerId);
 
                     io.to(playerId).emit('match_found', {
                         gameId: match.game._id,
-                        whitePlayer: { _id: whitePlayerId, username: whiteUsername },
-                        blackPlayer: { _id: blackPlayerId, username: blackUsername },
+                        whitePlayer: { _id: whitePlayerId, username: whiteUsername, isGuest: whitePlayerId.startsWith('guest_') },
+                        blackPlayer: { _id: blackPlayerId, username: blackUsername, isGuest: blackPlayerId.startsWith('guest_') },
                         yourColor: yourColor,
                         timeControl: match.game.timeControl,
                         clock: match.game.clock
