@@ -6,6 +6,7 @@ const { getAuth } = require('../middleware/clerkAuth');
 /**
  * GET /api/profile/overview
  * Returns combined stats + recent games for the authenticated user.
+ * Accepts query params ?page=1&limit=10
  * Response contract: ProfileOverviewResponse (v1)
  */
 const getProfileOverview = async (req, res) => {
@@ -16,6 +17,12 @@ const getProfileOverview = async (req, res) => {
         if (!clerkId) {
             return res.status(401).json({ error: 'Unauthorized' });
         }
+
+        // Pagination query params
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limitQuery = parseInt(req.query.limit) || 10;
+        const limit = Math.max(1, Math.min(50, limitQuery)); // clamp to 50
+        const skip = (page - 1) * limit;
 
         // ── User lookup ──
         const user = await User.findOne({ clerkId });
@@ -40,16 +47,23 @@ const getProfileOverview = async (req, res) => {
             memberSince: user.createdAt ? user.createdAt.toISOString() : null,
         };
 
-        // ── Recent games query ──
-        // whitePlayer/blackPlayer store Clerk ID strings
-        const games = await Game.find({
+        const query = {
             $or: [{ whitePlayer: clerkId }, { blackPlayer: clerkId }],
             status: 'completed',
             result: { $ne: 'aborted' }, // exclude aborted games
-        })
-            .sort({ createdAt: -1 })
-            .limit(10)
-            .lean();
+        };
+
+        // ── Recent games query ──
+        // whitePlayer/blackPlayer store Clerk ID strings
+        
+        const [totalRecentGames, games] = await Promise.all([
+            Game.countDocuments(query),
+            Game.find(query)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean()
+        ]);
 
         // ── Opponent enrichment (manual User lookup) ──
         const opponentClerkIds = new Set();
@@ -137,8 +151,19 @@ const getProfileOverview = async (req, res) => {
             };
         });
 
+        // Pagination metadata
+        const totalPages = Math.ceil(totalRecentGames / limit);
+        const pagination = {
+            page,
+            limit,
+            totalRecentGames,
+            totalPages,
+            hasNextPage: page < totalPages,
+            hasPrevPage: page > 1,
+        };
+
         // ── Response ──
-        res.json({ stats, recentGames });
+        res.json({ stats, recentGames, pagination });
     } catch (error) {
         console.error('❌ [Profile] Overview error:', error);
         res.status(500).json({ error: 'Internal server error' });
