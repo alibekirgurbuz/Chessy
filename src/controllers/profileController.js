@@ -30,15 +30,75 @@ const getProfileOverview = async (req, res) => {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        // ── Stats ──
-        const wins = user.wins || 0;
-        const losses = user.losses || 0;
-        const draws = user.draws || 0;
-        const totalGames = wins + losses + draws;
-        const winRate = totalGames === 0 ? 0 : Math.round((wins / totalGames) * 100);
+        // ── Recent games query & Stats Aggregation ──
+        const query = {
+            $or: [{ whitePlayer: clerkId }, { blackPlayer: clerkId }],
+            status: 'completed',
+            result: { $ne: 'aborted' }, // exclude aborted games
+        };
+
+        const resultFilter = req.query.resultFilter || 'all';
+        const gamesQuery = { ...query };
+
+        if (resultFilter === 'win') {
+            gamesQuery.$or = [
+                { whitePlayer: clerkId, result: 'white' },
+                { blackPlayer: clerkId, result: 'black' }
+            ];
+        } else if (resultFilter === 'loss') {
+            gamesQuery.$or = [
+                { whitePlayer: clerkId, result: 'black' },
+                { blackPlayer: clerkId, result: 'white' }
+            ];
+        } else if (resultFilter === 'draw') {
+            gamesQuery.result = 'draw';
+        }
+
+        const [statsAggregation, games] = await Promise.all([
+            Game.aggregate([
+                { $match: query },
+                {
+                    $group: {
+                        _id: null,
+                        totalGames: { $sum: 1 },
+                        wins: {
+                            $sum: {
+                                $cond: [
+                                    {
+                                        $or: [
+                                            { $and: [{ $eq: ["$whitePlayer", clerkId] }, { $eq: ["$result", "white"] }] },
+                                            { $and: [{ $eq: ["$blackPlayer", clerkId] }, { $eq: ["$result", "black"] }] }
+                                        ]
+                                    },
+                                    1,
+                                    0
+                                ]
+                            }
+                        },
+                        draws: {
+                            $sum: {
+                                $cond: [{ $eq: ["$result", "draw"] }, 1, 0]
+                            }
+                        }
+                    }
+                }
+            ]),
+            Game.find(gamesQuery)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit)
+                .lean()
+        ]);
+
+        const agg = statsAggregation[0] || { totalGames: 0, wins: 0, draws: 0 };
+        const totalGamesAgg = agg.totalGames;
+        const wins = agg.wins;
+        const draws = agg.draws;
+        const losses = totalGamesAgg - wins - draws;
+        const winRate = totalGamesAgg === 0 ? 0 : Math.round((wins / totalGamesAgg) * 100);
 
         const stats = {
-            totalGames,
+            totalGames: totalGamesAgg,
             wins,
             losses,
             draws,
@@ -47,23 +107,13 @@ const getProfileOverview = async (req, res) => {
             memberSince: user.createdAt ? user.createdAt.toISOString() : null,
         };
 
-        const query = {
-            $or: [{ whitePlayer: clerkId }, { blackPlayer: clerkId }],
-            status: 'completed',
-            result: { $ne: 'aborted' }, // exclude aborted games
-        };
+        let totalFilteredGames = totalGamesAgg;
+        switch (resultFilter) {
+            case 'win': totalFilteredGames = wins; break;
+            case 'loss': totalFilteredGames = losses; break;
+            case 'draw': totalFilteredGames = draws; break;
+        }
 
-        // ── Recent games query ──
-        // whitePlayer/blackPlayer store Clerk ID strings
-        
-        const [totalRecentGames, games] = await Promise.all([
-            Game.countDocuments(query),
-            Game.find(query)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .lean()
-        ]);
 
         // ── Opponent enrichment (manual User lookup) ──
         const opponentClerkIds = new Set();
@@ -152,11 +202,11 @@ const getProfileOverview = async (req, res) => {
         });
 
         // Pagination metadata
-        const totalPages = Math.ceil(totalRecentGames / limit);
+        const totalPages = Math.ceil(totalFilteredGames / limit) || 1;
         const pagination = {
             page,
             limit,
-            totalRecentGames,
+            totalRecentGames: totalFilteredGames,
             totalPages,
             hasNextPage: page < totalPages,
             hasPrevPage: page > 1,

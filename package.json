@@ -12,6 +12,7 @@
   "dependencies": {
     "@clerk/express": "^1.7.65",
     "@socket.io/redis-adapter": "^8.3.0",
+    "backend": "file:",
     "chess.js": "^1.4.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
