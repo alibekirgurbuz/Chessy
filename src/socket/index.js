@@ -41,6 +41,8 @@ function setupSocket(server) {
     const pubClient = redis.createClient();
     const subClient = pubClient.duplicate();
 
+    logger.info('🚀 [Socket] Initializing with Redis adapter for multi-instance scaling');
+
     const io = new Server(server, {
         cors: {
             origin: '*', // Development için tüm origin'lere izin ver
