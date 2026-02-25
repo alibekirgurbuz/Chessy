@@ -726,6 +726,7 @@ function gameHandler(io, socket) {
             game.resultReason = 'resignation';
             game.updatedAt = Date.now();
             game.queuedPremoves = { white: null, black: null };
+            game.pendingDrawOfferFrom = null; // Clear pending draw offer on resign
 
             await game.save();
 
@@ -743,6 +744,160 @@ function gameHandler(io, socket) {
 
         } catch (error) {
             console.error('resign_game error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+
+    // ==================== DRAW OFFERS ====================
+    socket.on('offer_draw', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+
+            if (!game) return socket.emit('error', { message: 'Game not found' });
+
+            const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+            const isBlackPlayer = game.blackPlayer.toString() === socket.userId;
+
+            if (!isWhitePlayer && !isBlackPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'ongoing') {
+                return socket.emit('error', { message: 'Game is not active' });
+            }
+
+            // Check limits (max 2 offers per game)
+            if (game.drawOffersCount >= 2) {
+                return socket.emit('error', { message: 'Maximum draw offers reached for this game' });
+            }
+
+            // Check if there is already a pending offer
+            if (game.pendingDrawOfferFrom) {
+                return socket.emit('error', { message: 'A draw offer is already pending' });
+            }
+
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+            const opponentId = isWhitePlayer ? game.blackPlayer.toString() : game.whitePlayer.toString();
+
+            // Update state
+            game.pendingDrawOfferFrom = playerColor;
+            game.drawOffersCount += 1;
+            await game.save();
+
+            // Send to opponent
+            socket.to(opponentId).emit('draw_offered', {
+                gameId,
+                by: playerColor
+            });
+
+            // Also emit to the same user's other sessions (e.g. mobile/web simultaneously open)
+            // so UI can update to show they offered a draw.
+            io.to(socket.userId).emit('draw_offered', {
+                gameId,
+                by: playerColor
+            });
+
+            logger.info(`User ${socket.userId} (${playerColor}) offered a draw in game ${gameId}`);
+
+        } catch (error) {
+            console.error('offer_draw error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+
+    socket.on('accept_draw', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+
+            if (!game) return socket.emit('error', { message: 'Game not found' });
+
+            const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+            const isBlackPlayer = game.blackPlayer.toString() === socket.userId;
+
+            if (!isWhitePlayer && !isBlackPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'ongoing') {
+                return socket.emit('error', { message: 'Game is not active' });
+            }
+
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+
+            // Validate there is a pending offer, and it's NOT from the accepting player
+            if (!game.pendingDrawOfferFrom) {
+                return socket.emit('error', { message: 'No pending draw offer to accept' });
+            }
+
+            if (game.pendingDrawOfferFrom === playerColor) {
+                return socket.emit('error', { message: 'You cannot accept your own draw offer' });
+            }
+
+            // End the game
+            game.status = 'completed';
+            game.result = 'draw';
+            game.resultReason = 'draw_agreed';
+            game.updatedAt = Date.now();
+            game.queuedPremoves = { white: null, black: null };
+            game.pendingDrawOfferFrom = null;
+
+            await game.save();
+
+            premoveManager.clearAll(gameId, 'game_over');
+            applyGameStats(gameId);
+
+            io.to(gameId).emit('game_over', {
+                gameId,
+                result: 'draw',
+                reason: 'draw_agreed'
+            });
+
+            logger.info(`User ${socket.userId} accepted draw in game ${gameId}`);
+
+        } catch (error) {
+            console.error('accept_draw error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+
+    socket.on('reject_draw', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+
+            if (!game) return socket.emit('error', { message: 'Game not found' });
+
+            const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+            const isBlackPlayer = game.blackPlayer.toString() === socket.userId;
+
+            if (!isWhitePlayer && !isBlackPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'ongoing') {
+                return socket.emit('error', { message: 'Game is not active' });
+            }
+
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+            const opponentId = isWhitePlayer ? game.blackPlayer.toString() : game.whitePlayer.toString();
+
+            // Validate there is a pending offer from the opponent
+            if (game.pendingDrawOfferFrom !== (playerColor === 'white' ? 'black' : 'white')) {
+                return socket.emit('error', { message: 'No valid pending draw offer to reject' });
+            }
+
+            game.pendingDrawOfferFrom = null;
+            await game.save();
+
+            // Emit rejection to both players so UI un-blocks
+            io.to(gameId).emit('draw_rejected', {
+                gameId,
+                by: playerColor
+            });
+
+            logger.info(`User ${socket.userId} rejected draw in game ${gameId}`);
+
+        } catch (error) {
+            console.error('reject_draw error:', error);
             socket.emit('error', { message: error.message });
         }
     });

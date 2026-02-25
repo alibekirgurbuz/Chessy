@@ -113,6 +113,15 @@ const gameSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    drawOffersCount: {
+      type: Number,
+      default: 0,
+    },
+    pendingDrawOfferFrom: {
+      type: String,
+      enum: ['white', 'black', null],
+      default: null,
+    },
   },
   {
     timestamps: true,
