@@ -3,6 +3,7 @@ const { Chess } = require('chess.js');
 const ClockManager = require('../services/ClockManager');
 const premoveManager = require('../services/PremoveManager');
 const PremoveTracer = require('../services/PremoveTracer');
+const Telemetry = require('../utils/telemetry');
 const logger = require('../utils/logger');
 const { applyGameStats } = require('../services/StatsService');
 
@@ -31,6 +32,8 @@ function gameHandler(io, socket) {
             sourceMoveNo: queuedPremove ? queuedPremove.sourceMoveNo : null
         });
         if (!queuedPremove) return;
+
+        const traceId = queuedPremove.traceId;
 
         // ── TRACE: queued_premove_found ──
         trace.mark('queued_premove_found', {
@@ -120,13 +123,17 @@ function gameHandler(io, socket) {
                         : game.blackPlayer.toString();
                     io.to(premovePlayerId).emit('premove_rejected', {
                         gameId,
-                        reason: clockError.message
+                        reason: clockError.message,
+                        traceId
                     });
                     io.to(gameId).emit('premove_cleared', {
                         gameId,
                         by: premoveColor,
-                        reason: 'rejected'
+                        reason: 'rejected',
+                        traceId
                     });
+
+                    if (traceId) Telemetry.log({ traceId, gameId, userId: premovePlayerId, event: 'premove_rejected' });
 
                     // ── Narrow DB persist (clock error) ──
                     await Game.updateOne({ _id: gameId }, {
@@ -183,21 +190,27 @@ function gameHandler(io, socket) {
                 pgn: updatedPgn,
                 currentTurn: chess.turn(),
                 fen: chess.fen(),
-                moveCount: chess.history().length
+                moveCount: chess.history().length,
+                traceId
             });
+
+            if (traceId) {
+                Telemetry.log({ traceId, gameId, event: 'premove_executed' });
+            }
 
             // ── TRACE: move_broadcast_sent ──
             trace.mark('move_broadcast_sent');
 
             if (clockState) {
-                io.to(gameId).emit('clock_update', clockState);
+                io.to(gameId).emit('clock_update', { ...clockState, traceId });
                 trace.mark('clock_update_sent');
             }
 
             io.to(gameId).emit('premove_cleared', {
                 gameId,
                 by: premoveColor,
-                reason: 'executed'
+                reason: 'executed',
+                traceId
             });
 
             if (updatedStatus === 'completed') {
@@ -250,14 +263,20 @@ function gameHandler(io, socket) {
                 : game.blackPlayer.toString();
             io.to(premovePlayerId).emit('premove_rejected', {
                 gameId,
-                reason: e.message || 'Invalid premove'
+                reason: e.message || 'Invalid premove',
+                traceId
             });
 
             io.to(gameId).emit('premove_cleared', {
                 gameId,
                 by: premoveColor,
-                reason: 'rejected'
+                reason: 'rejected',
+                traceId
             });
+
+            if (traceId) {
+                Telemetry.log({ traceId, gameId, userId: premovePlayerId, event: 'premove_rejected' });
+            }
 
             // ── Narrow DB persist (rejected) ──
             await Game.updateOne({ _id: gameId }, {
@@ -273,7 +292,17 @@ function gameHandler(io, socket) {
 
 
     // ==================== JOIN GAME ====================
-    socket.on('join_game', async ({ gameId }) => {
+    socket.on('join_game', async ({ gameId, traceId }, ack) => {
+        if (traceId) {
+            Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'join_game_received' });
+        }
+        let ackSent = false;
+        const sendAck = () => {
+            if (!ackSent && typeof ack === 'function') {
+                ack();
+                ackSent = true;
+            }
+        };
         try {
             const game = await Game.findById(gameId);
 
@@ -281,16 +310,35 @@ function gameHandler(io, socket) {
                 return socket.emit('error', { message: 'Game not found' });
             }
 
+            // Fast-ack receipt after minimal validation (game exists).
+            sendAck();
+
             // Socket'i oyun odasına ekle
             socket.join(gameId);
 
-            // Cancel any pending disconnect timeout if the disconnected user is rejoining
-            if (game.disconnectedPlayerId === socket.userId) {
-                game.disconnectedPlayerId = null;
-                game.disconnectDeadlineAt = null;
-                await game.save();
-                io.to(gameId).emit('opponent_reconnected', { playerId: socket.userId });
-                console.log(`User ${socket.userId} reconnected to game ${gameId}, cancelled disconnect timeout.`);
+            // Cancel pending disconnect timeout atomically if this same user was marked disconnected.
+            // Using updateOne avoids stale-document races during rapid refresh reconnects.
+            const reconnectClearResult = await Game.updateOne(
+                {
+                    _id: gameId,
+                    disconnectedPlayerId: socket.userId,
+                    status: 'ongoing'
+                },
+                {
+                    $set: {
+                        disconnectedPlayerId: null,
+                        disconnectDeadlineAt: null,
+                    }
+                }
+            );
+
+            if (reconnectClearResult.modifiedCount > 0) {
+                // Determine the original deadline to clear it locally (or just signal player reconnected)
+                io.to(gameId).emit('opponent_reconnected', { playerId: socket.userId, gameId: gameId });
+                logger.info(`[Socket] User ${socket.userId} reconnected to game ${gameId}, cancelled disconnect timeout.`);
+            } else if (game.status === 'ongoing' && game.disconnectedPlayerId === socket.userId) {
+                // Edge case: In case game object fetched earlier differs from what DB has, but still we didn't modify
+                // This shouldn't normally happen with atomic updates, but just loop back.
             }
 
             // Odadaki diğer kullanıcılara bildir
@@ -337,8 +385,25 @@ function gameHandler(io, socket) {
                 return id.startsWith('guest_') ? 'Misafir Oyuncu' : 'Oyuncu';
             };
 
-            const isWhiteSocketOnline = (await io.in(whiteId).fetchSockets()).length > 0;
-            const isBlackSocketOnline = (await io.in(blackId).fetchSockets()).length > 0;
+            let isWhiteSocketOnline = false;
+            let isBlackSocketOnline = false;
+            try {
+                isWhiteSocketOnline = (await io.in(whiteId).fetchSockets()).length > 0;
+                isBlackSocketOnline = (await io.in(blackId).fetchSockets()).length > 0;
+
+                // Fallback: Check overall connected sockets if room join was delayed
+                if (!isWhiteSocketOnline || !isBlackSocketOnline) {
+                    const allSockets = await io.fetchSockets();
+                    if (!isWhiteSocketOnline) {
+                        isWhiteSocketOnline = allSockets.some(s => s.userId === whiteId);
+                    }
+                    if (!isBlackSocketOnline) {
+                        isBlackSocketOnline = allSockets.some(s => s.userId === blackId);
+                    }
+                }
+            } catch (err) {
+                logger.warn('Error checking online sockets:', err);
+            }
 
             const whitePlayerInfo = {
                 _id: whiteId,
@@ -364,13 +429,20 @@ function gameHandler(io, socket) {
                     currentTurn: chess.turn(),
                     moveCount: chess.history().length,
                     serverTimestamp: Date.now()
-                }
+                },
+                traceId
             });
+
+            if (traceId) {
+                Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'join_game_response' });
+            }
 
             // Send initial clock update
             if (game.clock) {
                 const clock = ClockManager.fromJSON(game.clock);
-                io.to(gameId).emit('clock_update', clock.getState());
+                const clockState = clock.getState();
+                socket.emit('clock_update', clockState);
+                io.to(gameId).emit('clock_update', clockState);
             }
 
             // Rehydrate premoves from DB into in-memory manager
@@ -387,309 +459,438 @@ function gameHandler(io, socket) {
     });
 
     // ==================== MAKE MOVE (with premove auto-execute) ====================
-    socket.on('make_move', async ({ gameId, move, clientTimestamp }) => {
-        await premoveManager.withLock(gameId, async () => {
-            try {
-                const game = await Game.findById(gameId);
+    socket.on('make_move', async ({ gameId, move, clientTimestamp, traceId }, ack) => {
+        if (traceId) {
+            Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'make_move_received' });
+        }
 
-                if (!game) {
-                    return socket.emit('error', { message: 'Game not found' });
+        let ackSent = false;
+        const sendAck = () => {
+            if (!ackSent && typeof ack === 'function') {
+                ack();
+                ackSent = true;
+                if (traceId) Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'make_move_ack_sent' });
+            }
+        };
+
+        // 1. Pre-lock lightweight checks
+        if (!move || typeof move !== 'object' || !move.from || !move.to) {
+            return socket.emit('error', { message: 'Invalid move data' });
+        }
+
+        // Fast-ack on receipt to avoid lock queue and DB read latency in callback RTT.
+        sendAck();
+
+        const lockStart = Date.now();
+        let lockAcquired = 0;
+
+        // Variables for background processing (Must stay in outer-scope for post-lock pipeline. Do NOT shadow with 'let' inside the lock)
+        let moveDbUpdate = null;
+        let isGameOver = false;
+        let clockState = null;
+        let updatedPgn = null;
+        let moveResultSan = null;
+        let moveResultFrom = null;
+        let moveResultTo = null;
+        let currentTurn = null;
+        let fen = null;
+        let moveCount = null;
+        let gameRef = null;
+        let chessRef = null;
+
+        try {
+            await premoveManager.withLock(gameId, async () => {
+                lockAcquired = Date.now();
+                if (traceId) {
+                    Telemetry.log({ traceId, gameId, event: 'lock_acquired', meta: { lock_wait_ms: lockAcquired - lockStart, type: 'make_move' } });
                 }
 
-                // Kullanıcının oyunda olduğunu kontrol et
-                const isPlayer = game.whitePlayer.toString() === socket.userId ||
-                    game.blackPlayer.toString() === socket.userId;
+                try {
+                    // DB read must be inside lock to prevent Lost Updates on concurrent moves
+                    let game = await Game.findById(gameId).select('+pgn +clock +whitePlayer +blackPlayer +status +result').lean();
+                    if (!game) {
+                        return socket.emit('error', { message: 'Game not found' });
+                    }
 
-                if (!isPlayer) {
-                    return socket.emit('error', { message: 'You are not in this game' });
-                }
+                    // Kullanıcının oyunda olduğunu kontrol et
+                    const isPlayer = game.whitePlayer.toString() === socket.userId ||
+                        game.blackPlayer.toString() === socket.userId;
 
-                // Chess.js ile hamleyi validate et
-                const chess = new Chess();
-                if (game.pgn) {
-                    chess.loadPgn(game.pgn);
-                }
+                    if (!isPlayer) {
+                        return socket.emit('error', { message: 'You are not in this game' });
+                    }
 
-                // Sıra kontrolü
-                const isWhiteTurn = chess.turn() === 'w';
-                const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+                    // Chess.js ile hamleyi validate et
+                    const chess = new Chess();
+                    if (game.pgn) {
+                        chess.loadPgn(game.pgn);
+                    }
 
-                if ((isWhiteTurn && !isWhitePlayer) || (!isWhiteTurn && isWhitePlayer)) {
-                    return socket.emit('error', { message: 'Not your turn' });
-                }
+                    // Sıra kontrolü
+                    const isWhiteTurn = chess.turn() === 'w';
+                    const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
 
-                const moveResult = chess.move(move);
-                if (!moveResult) {
-                    logger.warn(`🚫 Invalid move attempt by ${socket.userId} in ${gameId} | Move: ${JSON.stringify(move)} | Socket: ${socket.id}`);
-                    return socket.emit('error', { message: 'Invalid move' });
-                }
+                    if ((isWhiteTurn && !isWhitePlayer) || (!isWhiteTurn && isWhitePlayer)) {
+                        return socket.emit('error', { message: 'Not your turn' });
+                    }
 
-                logger.info(`♟️ Move made: ${moveResult.san} by ${socket.userId} in ${gameId} | Socket: ${socket.id}`);
+                    const moveResult = chess.move(move);
+                    if (!moveResult) {
+                        logger.warn(`🚫 Invalid move attempt by ${socket.userId} in ${gameId} | Move: ${JSON.stringify(move)} | Socket: ${socket.id}`);
+                        return socket.emit('error', { message: 'Invalid move' });
+                    }
 
-                // Clear the mover's own premove if they had one (they played a normal move instead)
-                const moverColor = isWhitePlayer ? 'white' : 'black';
-                if (premoveManager.getPremove(game, moverColor)) {
-                    premoveManager.clearPremove(gameId, moverColor, 'normal_move_override');
-                    game.queuedPremoves[moverColor] = null;
-                    io.to(gameId).emit('premove_cleared', {
-                        gameId,
-                        by: moverColor,
-                        reason: 'cancelled'
-                    });
-                }
+                    if (traceId) {
+                        Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'make_move_validated' });
+                    }
 
-                logger.info(`[DEBUG] About to enter clock logic. gameId=${gameId}, moveResult=${moveResult.san}`);
+                    logger.info(`♟️ Move made: ${moveResult.san} by ${socket.userId} in ${gameId} | Socket: ${socket.id}`);
 
-                // ========== CLOCK LOGIC START ==========
-                let clockState = null;
-                if (game.clock) {
-                    const clock = ClockManager.fromJSON(game.clock);
-                    const playerColor = isWhitePlayer ? 'w' : 'b';
+                    // Clear the mover's own premove if they had one (they played a normal move instead)
+                    const moverColor = isWhitePlayer ? 'white' : 'black';
+                    if (premoveManager.getPremove(game, moverColor)) {
+                        premoveManager.clearPremove(gameId, moverColor, 'normal_move_override');
+                        if (!game.queuedPremoves) game.queuedPremoves = {};
+                        game.queuedPremoves[moverColor] = null;
+                        io.to(gameId).emit('premove_cleared', {
+                            gameId,
+                            by: moverColor,
+                            reason: 'cancelled'
+                        });
+                    }
 
-                    logger.debug('🕐 Clock Debug:', {
-                        playerColor,
-                        activeColor: clock.activeColor,
-                        isWhitePlayer,
-                        userId: socket.userId,
-                        whitePlayer: game.whitePlayer.toString(),
-                        blackPlayer: game.blackPlayer.toString()
-                    });
+                    logger.info(`[DEBUG] About to enter clock logic. gameId=${gameId}, moveResult=${moveResult.san}`);
 
-                    try {
-                        clockState = clock.makeMove(playerColor, clientTimestamp || Date.now());
+                    // ========== CLOCK LOGIC START ==========
+                    if (game.clock) {
+                        const clock = ClockManager.fromJSON(game.clock);
+                        const playerColor = isWhitePlayer ? 'w' : 'b';
 
-                        // Check for timeout
-                        if (clockState.timeout) {
-                            game.status = 'completed';
-                            game.result = clockState.winner;
-                            game.clock = clock.toJSON();
-                            await game.save();
+                        logger.debug('🕐 Clock Debug:', {
+                            playerColor,
+                            activeColor: clock.activeColor,
+                            isWhitePlayer,
+                            userId: socket.userId,
+                            whitePlayer: game.whitePlayer.toString(),
+                            blackPlayer: game.blackPlayer.toString()
+                        });
 
-                            io.to(gameId).emit('game_over', {
-                                gameId,
-                                result: clockState.winner,
-                                reason: 'timeout'
-                            });
-                            io.to(gameId).emit('clock_update', clockState);
-                            premoveManager.clearAll(gameId, 'game_over');
-                            applyGameStats(gameId);
-                            return;
+                        try {
+                            clockState = clock.makeMove(playerColor, clientTimestamp || Date.now());
+
+                            if (clockState.timeout) {
+                                game.status = 'completed';
+                                game.result = clockState.winner;
+                                game.clock = clock.toJSON();
+                                // We will persist this using updateOne later, skip save() here to avoid blocking
+
+                                io.to(gameId).emit('game_over', {
+                                    gameId,
+                                    result: clockState.winner,
+                                    reason: 'timeout'
+                                });
+                                io.to(gameId).emit('clock_update', clockState);
+                                premoveManager.clearAll(gameId, 'game_over');
+                                // DO NOT return here, let it fall through to the DB persist at the end!
+                                isGameOver = true;
+                            } else {
+                                game.clock = clock.toJSON();
+                            }
+
+                        } catch (clockError) {
+                            console.error('[DEBUG] Clock error in make_move!!!', clockError);
+                            return socket.emit('error', { message: clockError.message });
                         }
-
-                        game.clock = clock.toJSON();
-
-                    } catch (clockError) {
-                        console.error('[DEBUG] Clock error in make_move!!!', clockError);
-                        return socket.emit('error', { message: clockError.message });
                     }
-                }
-                // ========== CLOCK LOGIC END ==========
+                    // ========== CLOCK LOGIC END ==========
 
-                logger.info(`[DEBUG] Clock logic passed! Updating PGN and status...`);
+                    logger.info(`[DEBUG] Clock logic passed! Updating PGN and status...`);
 
-                // PGN'i güncelle
-                const updatedPgn = chess.pgn();
-                const updatedAt = Date.now();
-                game.pgn = updatedPgn;
-                game.updatedAt = updatedAt;
+                    updatedPgn = chess.pgn();
+                    const updatedAt = Date.now();
+                    game.pgn = updatedPgn;
+                    game.updatedAt = updatedAt;
 
-                // Mat/beraberlik kontrolü
-                let isGameOver = false;
-                if (chess.isGameOver()) {
-                    isGameOver = true;
-                    game.status = 'completed';
-                    if (chess.isCheckmate()) {
-                        game.result = chess.turn() === 'w' ? 'black' : 'white';
-                        game.resultReason = 'checkmate';
-                    } else if (chess.isDraw()) {
-                        game.result = 'draw';
-                        game.resultReason = chess.isStalemate() ? 'stalemate' : 'draw';
+                    // Mat/beraberlik kontrolü
+                    // Check if game was already marked over by timeout
+                    if (!isGameOver && chess.isGameOver()) {
+                        isGameOver = true;
+                        game.status = 'completed';
+                        if (chess.isCheckmate()) {
+                            game.result = chess.turn() === 'w' ? 'black' : 'white';
+                            game.resultReason = 'checkmate';
+                        } else if (chess.isDraw()) {
+                            game.result = 'draw';
+                            game.resultReason = chess.isStalemate() ? 'stalemate' : 'draw';
+                        }
                     }
-                }
 
-                // ── Broadcast-first: emit before DB persist ──
+                    // Prepare DB Payload (Make sure we use lean object)
+                    moveDbUpdate = {
+                        pgn: updatedPgn,
+                        updatedAt,
+                    };
+                    if (game.clock) moveDbUpdate.clock = game.clock;
+                    if (moverColor && premoveManager.getPremove(game, moverColor) === null) {
+                        moveDbUpdate[`queuedPremoves.${moverColor}`] = null;
+                    }
+                    if (isGameOver) {
+                        moveDbUpdate.status = game.status;
+                        moveDbUpdate.result = game.result;
+                        moveDbUpdate.resultReason = game.resultReason;
+                    }
+
+                    // Save refs for background execution
+                    moveResultSan = moveResult.san;
+                    moveResultFrom = moveResult.from;
+                    moveResultTo = moveResult.to;
+                    currentTurn = chess.turn();
+                    fen = chess.fen();
+                    moveCount = chess.history().length;
+                    gameRef = game;
+                    chessRef = chess;
+
+                } catch (error) {
+                    console.error('make_move inside-lock error:', error);
+                    socket.emit('error', { message: error.message });
+                }
+            });
+            if (traceId) Telemetry.log({ traceId, gameId, event: 'lock_released', meta: { lock_hold_ms: Date.now() - lockStart } });
+
+            // ── OUTSIDE LOCK: Broadcast & Persist ──
+            if (moveDbUpdate && gameRef) {
+                // Background Broadcast
                 io.to(gameId).emit('move_made', {
                     gameId,
-                    move: moveResult.san,
-                    from: moveResult.from,
-                    to: moveResult.to,
+                    move: moveResultSan,
+                    from: moveResultFrom,
+                    to: moveResultTo,
                     pgn: updatedPgn,
-                    currentTurn: chess.turn(),
-                    fen: chess.fen(),
-                    moveCount: chess.history().length
+                    currentTurn,
+                    fen,
+                    moveCount,
+                    traceId
                 });
 
-                // Broadcast clock update
                 if (clockState) {
-                    io.to(gameId).emit('clock_update', clockState);
+                    io.to(gameId).emit('clock_update', { ...clockState, traceId });
+                    if (traceId) Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'clock_update_emit' });
                 }
 
-                // Oyun bittiyse bildir
+                if (traceId) Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'make_move_broadcast' });
+
                 if (isGameOver) {
                     io.to(gameId).emit('game_over', {
                         gameId,
-                        result: game.result,
-                        reason: chess.isCheckmate() ? 'checkmate' : 'draw'
+                        result: gameRef.result,
+                        // Fix: Ensure reason is emitted correctly for checkmate, timeout, etc.
+                        reason: gameRef.resultReason || 'checkmate'
                     });
                     premoveManager.clearAll(gameId, 'game_over');
-                    applyGameStats(gameId);
+                    applyGameStats(gameId).catch(err => logger.error('applyGameStats err:', err));
                 }
 
-                logger.debug(`Move made in game ${gameId}: ${moveResult.san}`);
+                // Background DB Persist + Premove Auto-Execute
+                setImmediate(async () => {
+                    try {
+                        if (traceId) Telemetry.log({ traceId, gameId, event: 'make_move_persist_start' });
+                        const persistStart = Date.now();
+                        await Game.updateOne({ _id: gameId }, { $set: moveDbUpdate });
+                        if (traceId) Telemetry.log({ traceId, gameId, event: 'make_move_persist_end', latencyMs: Date.now() - persistStart });
 
-                // ── Narrow DB persist (make_move) ──
-                const moveDbUpdate = {
-                    pgn: updatedPgn,
-                    updatedAt,
-                };
-                if (game.clock) moveDbUpdate.clock = game.clock;
-                if (moverColor && premoveManager.getPremove(gameId, moverColor) === null) {
-                    moveDbUpdate[`queuedPremoves.${moverColor}`] = null;
-                }
-                if (isGameOver) {
-                    moveDbUpdate.status = game.status;
-                    moveDbUpdate.result = game.result;
-                    moveDbUpdate.resultReason = game.resultReason;
-                }
-                await Game.updateOne({ _id: gameId }, { $set: moveDbUpdate });
-
-                // ========== PREMOVE AUTO-EXECUTE ==========
-                // If game is not over, try to execute the opponent's queued premove
-                if (!isGameOver) {
-                    await tryExecuteQueuedPremove(game, chess, gameId);
-                }
-
-            } catch (error) {
-                console.error('make_move error:', error);
-                socket.emit('error', { message: error.message });
+                        // If game is not over, try to execute the opponent's queued premove
+                        if (!isGameOver) {
+                            await tryExecuteQueuedPremove(gameRef, chessRef, gameId);
+                        }
+                    } catch (err) {
+                        logger.error('Failed to async persist move to DB:', err);
+                        io.to(socket.id).emit('error', { message: 'Sync error: Failed to persist move' });
+                    }
+                });
             }
-        });
+
+        } catch (error) {
+            console.error('make_move outer lock error:', error);
+            socket.emit('error', { message: error.message || 'System busy. Please try again.' });
+        }
     });
 
     // ==================== SET PREMOVE ====================
-    socket.on('set_premove', async ({ gameId, premove }) => {
+    socket.on('set_premove', async ({ gameId, premove, traceId }, ack) => {
+        if (traceId) {
+            Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'set_premove_received' });
+        }
         logger.debug('[PREMOVE_DIAG] set_premove_received', { gameId, socketId: socket.id, userId: socket.userId, premove });
-        await premoveManager.withLock(gameId, async () => {
-            try {
-                const game = await Game.findById(gameId);
 
-                if (!game) {
-                    return socket.emit('error', { message: 'Game not found' });
+        let ackSent = false;
+        const sendAck = () => {
+            if (!ackSent && typeof ack === 'function') {
+                ack();
+                ackSent = true;
+                if (traceId) Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'set_premove_ack_sent' });
+            }
+        };
+
+        // 1. Pre-lock lightweight checks
+        if (!premove || typeof premove !== 'object' || !premove.from || !premove.to) {
+            logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, reason: 'Invalid premove data format' });
+            return socket.emit('premove_rejected', {
+                gameId,
+                reason: 'Invalid premove data',
+                traceId
+            });
+        }
+
+        // Fast-ack on receipt to avoid lock queue and DB read latency in callback RTT.
+        sendAck();
+
+        const lockStart = Date.now();
+        let dbPersistData = null; // Used to persist outside lock
+        let playerColorRef = null;
+        let lockAcquired = 0;
+
+        try {
+            await premoveManager.withLock(gameId, async () => {
+                lockAcquired = Date.now();
+                if (traceId) Telemetry.log({ traceId, gameId, event: 'lock_acquired', meta: { lock_wait_ms: lockAcquired - lockStart, type: 'set_premove' } });
+
+                try {
+                    // DB read inside lock to prevent race conditions
+                    let game = await Game.findById(gameId).select('+pgn +whitePlayer +blackPlayer +status').lean();
+                    if (!game) {
+                        return socket.emit('error', { message: 'Game not found' });
+                    }
+
+                    // Check game is ongoing
+                    if (game.status !== 'ongoing') {
+                        return socket.emit('premove_rejected', {
+                            gameId,
+                            reason: 'Game is not active'
+                        });
+                    }
+
+                    // Check player is in the game
+                    const playerColor = getPlayerColor(game);
+                    if (!playerColor) {
+                        return socket.emit('error', { message: 'You are not in this game' });
+                    }
+
+                    // Check it's NOT the player's turn (premove = move when it's not your turn)
+                    const chess = new Chess();
+                    if (game.pgn) {
+                        chess.loadPgn(game.pgn);
+                    }
+                    const currentTurnColor = chess.turn() === 'w' ? 'white' : 'black';
+                    logger.debug('[PREMOVE_DIAG] set_premove_turn_check', { gameId, playerColor, currentTurnColor, isPlayersTurn: currentTurnColor === playerColor });
+                    if (currentTurnColor === playerColor) {
+                        logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, playerColor, reason: 'It is your turn' });
+                        return socket.emit('premove_rejected', {
+                            gameId,
+                            reason: 'It is your turn — make a normal move'
+                        });
+                    }
+
+
+
+                    // Store premove (overwrites any existing) - Memory Only inside lock
+                    const setAt = Date.now();
+                    const sourceMoveNo = chess.history().length;
+
+                    if (traceId) Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'set_premove_validated' });
+
+                    const queuedData = {
+                        from: premove.from,
+                        to: premove.to,
+                        promotion: premove.promotion || undefined,
+                        setAt,
+                        sourceMoveNo,
+                        traceId
+                    };
+
+                    premoveManager.setPremove(gameId, playerColor, queuedData);
+
+                    dbPersistData = queuedData;
+                    playerColorRef = playerColor;
+
+                } catch (error) {
+                    console.error('set_premove error:', error);
+                    socket.emit('error', { message: error.message });
                 }
+            });
+            if (traceId) Telemetry.log({ traceId, gameId, event: 'lock_released', meta: { lock_hold_ms: Date.now() - lockStart } });
 
-                // Check game is ongoing
-                if (game.status !== 'ongoing') {
-                    return socket.emit('premove_rejected', {
-                        gameId,
-                        reason: 'Game is not active'
-                    });
-                }
-
-                // Check player is in the game
-                const playerColor = getPlayerColor(game);
-                if (!playerColor) {
-                    return socket.emit('error', { message: 'You are not in this game' });
-                }
-
-                // Check it's NOT the player's turn (premove = move when it's not your turn)
-                const chess = new Chess();
-                if (game.pgn) {
-                    chess.loadPgn(game.pgn);
-                }
-                const currentTurnColor = chess.turn() === 'w' ? 'white' : 'black';
-                logger.debug('[PREMOVE_DIAG] set_premove_turn_check', { gameId, playerColor, currentTurnColor, isPlayersTurn: currentTurnColor === playerColor });
-                if (currentTurnColor === playerColor) {
-                    logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, playerColor, reason: 'It is your turn' });
-                    return socket.emit('premove_rejected', {
-                        gameId,
-                        reason: 'It is your turn — make a normal move'
-                    });
-                }
-
-                // Validate premove data
-                if (!premove || !premove.from || !premove.to) {
-                    logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, playerColor, reason: 'Invalid premove data' });
-                    return socket.emit('premove_rejected', {
-                        gameId,
-                        reason: 'Invalid premove data'
-                    });
-                }
-
-                // Store premove (overwrites any existing)
-                const setAt = Date.now();
-                const sourceMoveNo = chess.history().length;
-                premoveManager.setPremove(gameId, playerColor, {
-                    from: premove.from,
-                    to: premove.to,
-                    promotion: premove.promotion || undefined,
-                    setAt,
-                    sourceMoveNo
-                });
-
-                // Persist to DB
-                if (!game.queuedPremoves) {
-                    game.queuedPremoves = { white: null, black: null };
-                }
-                game.queuedPremoves[playerColor] = {
-                    from: premove.from,
-                    to: premove.to,
-                    promotion: premove.promotion || null,
-                    setAt,
-                    sourceMoveNo
-                };
-                await game.save();
-                logger.debug('[PREMOVE_DIAG] set_premove_stored', { gameId, playerColor, premove: { from: premove.from, to: premove.to, promotion: premove.promotion }, setAt, sourceMoveNo, persisted: true });
-
-                // Notify room
+            // ── OUTSIDE LOCK: Broadcast & Persist ──
+            if (dbPersistData && playerColorRef) {
+                // Background Broadcast
                 io.to(gameId).emit('premove_set', {
                     gameId,
-                    by: playerColor,
-                    premove: { from: premove.from, to: premove.to, promotion: premove.promotion }
+                    by: playerColorRef,
+                    premove: { from: premove.from, to: premove.to, promotion: premove.promotion },
+                    traceId
                 });
 
-            } catch (error) {
-                console.error('set_premove error:', error);
-                socket.emit('error', { message: error.message });
+                // Background DB Persist
+                setImmediate(async () => {
+                    try {
+                        if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_start' });
+                        const persistStart = Date.now();
+                        await Game.updateOne(
+                            { _id: gameId },
+                            { $set: { [`queuedPremoves.${playerColorRef}`]: dbPersistData } }
+                        );
+                        if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_end', latencyMs: Date.now() - persistStart });
+                    } catch (err) {
+                        logger.error('Failed to async persist queued premove to DB:', err);
+                        if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_error', meta: { error: err.message } });
+                        // Let client know that sync failed
+                        io.to(socket.id).emit('error', { message: 'Sync error: Failed to persist premove.' });
+                    }
+                });
             }
-        });
+        } catch (error) {
+            console.error('set_premove outer lock error:', error);
+            socket.emit('error', { message: error.message || 'System busy. Please try again.' });
+        }
     });
 
     // ==================== CANCEL PREMOVE ====================
     socket.on('cancel_premove', async ({ gameId }) => {
-        await premoveManager.withLock(gameId, async () => {
-            try {
-                const game = await Game.findById(gameId);
+        try {
+            await premoveManager.withLock(gameId, async () => {
+                try {
+                    const game = await Game.findById(gameId);
 
-                if (!game) {
-                    return socket.emit('error', { message: 'Game not found' });
+                    if (!game) {
+                        return socket.emit('error', { message: 'Game not found' });
+                    }
+
+                    const playerColor = getPlayerColor(game);
+                    if (!playerColor) {
+                        return socket.emit('error', { message: 'You are not in this game' });
+                    }
+
+                    // Clear premove
+                    premoveManager.clearPremove(gameId, playerColor, 'cancelled');
+
+                    // Persist
+                    if (game.queuedPremoves) {
+                        game.queuedPremoves[playerColor] = null;
+                        await game.save();
+                    }
+
+                    // Notify room and user
+                    io.to(gameId).emit('premove_cleared', { gameId, by: playerColor, reason: 'cancelled' });
+                    socket.emit('premove_cleared', { gameId, by: playerColor, reason: 'cancelled' });
+
+                } catch (error) {
+                    console.error('cancel_premove error inside lock:', error);
+                    socket.emit('error', { message: error.message });
                 }
-
-                const playerColor = getPlayerColor(game);
-                if (!playerColor) {
-                    return socket.emit('error', { message: 'You are not in this game' });
-                }
-
-                // Clear premove
-                premoveManager.clearPremove(gameId, playerColor, 'cancelled');
-
-                // Persist
-                if (game.queuedPremoves) {
-                    game.queuedPremoves[playerColor] = null;
-                    await game.save();
-                }
-
-                // Notify room
-                io.to(gameId).emit('premove_cleared', {
-                    gameId,
-                    by: playerColor,
-                    reason: 'cancelled'
-                });
-
-            } catch (error) {
-                console.error('cancel_premove error:', error);
-                socket.emit('error', { message: error.message });
-            }
-        });
+            });
+        } catch (error) {
+            console.error('cancel_premove lock error:', error);
+            socket.emit('error', { message: 'Sistem meşgul, lütfen tekrar deneyin.' });
+        }
     });
 
     // ==================== LEAVE GAME ====================
@@ -957,6 +1158,186 @@ function gameHandler(io, socket) {
 
         } catch (error) {
             console.error('cancel_game error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+    // ==================== REMATCH OFFERS ====================
+    socket.on('offer_rematch', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+            if (!game) return socket.emit('error', { message: 'Game not found' });
+
+            const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+            const isBlackPlayer = game.blackPlayer.toString() === socket.userId;
+
+            if (!isWhitePlayer && !isBlackPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'completed') {
+                return socket.emit('error', { message: 'Rematch is only available after the game is completed' });
+            }
+
+            if (game.rematchDeclined) {
+                return socket.emit('error', { message: 'Rematch has already been declined' });
+            }
+
+            if (game.rematchOfferFrom) {
+                return socket.emit('error', { message: 'A rematch offer is already pending' });
+            }
+
+            if (game.nextGameId) {
+                return socket.emit('error', { message: 'A rematch has already been accepted' });
+            }
+
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+            const opponentId = isWhitePlayer ? game.blackPlayer.toString() : game.whitePlayer.toString();
+
+            // Update state
+            game.rematchOfferFrom = playerColor;
+            await game.save();
+
+            // Send to opponent
+            socket.to(opponentId).emit('rematch_offered', {
+                gameId,
+                by: playerColor
+            });
+
+            // Emit to same user
+            io.to(socket.userId).emit('rematch_offered', {
+                gameId,
+                by: playerColor
+            });
+
+            logger.info(`User ${socket.userId} (${playerColor}) offered a rematch in game ${gameId}`);
+
+        } catch (error) {
+            console.error('offer_rematch error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+
+    socket.on('accept_rematch', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+            if (!game) return socket.emit('error', { message: 'Game not found' });
+
+            const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+            const isBlackPlayer = game.blackPlayer.toString() === socket.userId;
+
+            if (!isWhitePlayer && !isBlackPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'completed') {
+                return socket.emit('error', { message: 'Rematch is only available after the game is completed' });
+            }
+
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+
+            if (!game.rematchOfferFrom) {
+                return socket.emit('error', { message: 'No pending rematch offer to accept' });
+            }
+
+            if (game.rematchOfferFrom === playerColor) {
+                return socket.emit('error', { message: 'You cannot accept your own rematch offer' });
+            }
+
+            if (game.nextGameId) {
+                // If double clicked, or somehow handled twice, avoid duplicate game creation
+                return;
+            }
+
+            // Create new game (swapping colors from the old game)
+            // Old White -> New Black
+            // Old Black -> New White
+            const newWhitePlayerId = game.blackPlayer.toString();
+            const newBlackPlayerId = game.whitePlayer.toString();
+
+            const baseTime = game.timeControl.time * 60 * 1000;
+            const increment = game.timeControl.increment * 1000;
+
+            const newGame = new Game({
+                whitePlayer: newWhitePlayerId,
+                blackPlayer: newBlackPlayerId,
+                pgn: '',
+                status: 'ongoing',
+                timeControl: {
+                    time: game.timeControl.time,
+                    increment: game.timeControl.increment,
+                    label: game.timeControl.label
+                },
+                clock: {
+                    whiteTime: baseTime,
+                    blackTime: baseTime,
+                    activeColor: null,
+                    lastMoveAt: null,
+                    firstMoveDeadline: Date.now() + 30000,
+                    moveCount: 0,
+                    baseTime: baseTime,
+                    increment: increment
+                }
+            });
+
+            await newGame.save();
+
+            // Store ref on the old game
+            game.nextGameId = newGame._id.toString();
+            game.rematchOfferFrom = null; // Clear offer state
+            await game.save();
+
+            // Broadcast acceptance to both players in the old room
+            io.to(gameId).emit('rematch_accepted', {
+                gameId,
+                newGameId: newGame._id.toString()
+            });
+
+            logger.info(`User ${socket.userId} accepted rematch for game ${gameId}. New game: ${newGame._id}`);
+
+        } catch (error) {
+            console.error('accept_rematch error:', error);
+            socket.emit('error', { message: error.message });
+        }
+    });
+
+    socket.on('reject_rematch', async ({ gameId }) => {
+        try {
+            const game = await Game.findById(gameId);
+            if (!game) return socket.emit('error', { message: 'Game not found' });
+
+            const isWhitePlayer = game.whitePlayer.toString() === socket.userId;
+            const isBlackPlayer = game.blackPlayer.toString() === socket.userId;
+
+            if (!isWhitePlayer && !isBlackPlayer) {
+                return socket.emit('error', { message: 'You are not in this game' });
+            }
+
+            if (game.status !== 'completed') {
+                return socket.emit('error', { message: 'Game is not completed' });
+            }
+
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+
+            // Validate there is a pending offer from the opponent
+            if (game.rematchOfferFrom !== (playerColor === 'white' ? 'black' : 'white')) {
+                return socket.emit('error', { message: 'No valid pending rematch offer to reject' });
+            }
+
+            // Set state to declined so no more offers can be made
+            game.rematchDeclined = true;
+            game.rematchOfferFrom = null;
+            await game.save();
+
+            // Emit rejection to both players
+            io.to(gameId).emit('rematch_rejected', {
+                gameId,
+                by: playerColor
+            });
+
+            logger.info(`User ${socket.userId} rejected rematch in game ${gameId}`);
+
+        } catch (error) {
+            console.error('reject_rematch error:', error);
             socket.emit('error', { message: error.message });
         }
     });

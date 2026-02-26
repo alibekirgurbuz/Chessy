@@ -28,7 +28,8 @@ class PremoveManager {
             to: p.to,
             promotion: p.promotion,
             setAt: p.setAt,
-            sourceMoveNo: p.sourceMoveNo
+            sourceMoveNo: p.sourceMoveNo,
+            traceId: p.traceId
         };
     }
 

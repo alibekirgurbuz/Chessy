@@ -57,6 +57,28 @@ class TimeoutChecker {
             for (const game of games) {
                 // 1) Check disconnect deadline FIRST
                 if (game.disconnectDeadlineAt && Date.now() >= game.disconnectDeadlineAt) {
+                    // Safety net:
+                    // If the supposedly disconnected player already has an active socket again,
+                    // clear stale disconnect marker instead of forfeiting the game.
+                    if (game.disconnectedPlayerId) {
+                        const sockets = await this.io.in(game.disconnectedPlayerId).fetchSockets();
+                        if (sockets.length > 0) {
+                            await Game.updateOne(
+                                { _id: game._id, disconnectedPlayerId: game.disconnectedPlayerId },
+                                {
+                                    $set: {
+                                        disconnectedPlayerId: null,
+                                        disconnectDeadlineAt: null,
+                                    }
+                                }
+                            );
+                            this.io.to(game._id.toString()).emit('opponent_reconnected', {
+                                playerId: game.disconnectedPlayerId
+                            });
+                            continue;
+                        }
+                    }
+
                     const winner = game.disconnectedPlayerId === game.whitePlayer.toString() ? 'black' : 'white';
                     await this.handleDisconnectTimeout(game, winner);
                     continue; // Skip clock checks if game is forfeit
@@ -90,17 +112,23 @@ class TimeoutChecker {
      */
     async handleFirstMoveTimeout(game) {
         try {
-            // Guard: re-check status to prevent duplicate termination from concurrent ticks
-            const freshGame = await Game.findById(game._id);
-            if (!freshGame || freshGame.status !== 'ongoing') return;
+            const now = Date.now();
+            const result = await Game.updateOne(
+                { _id: game._id, status: 'ongoing' },
+                {
+                    $set: {
+                        status: 'completed',
+                        result: 'aborted',
+                        resultReason: 'cancelled_due_to_first_move_timeout',
+                        updatedAt: now,
+                        queuedPremoves: { white: null, black: null }
+                    }
+                }
+            );
+
+            if (result.modifiedCount === 0) return;
 
             console.log(`⏱️  First move timeout for game ${game._id}`);
-
-            freshGame.status = 'completed';
-            freshGame.result = 'aborted';
-            freshGame.resultReason = 'cancelled_due_to_first_move_timeout';
-            freshGame.updatedAt = Date.now();
-            await freshGame.save();
 
             // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {
@@ -120,18 +148,24 @@ class TimeoutChecker {
      */
     async handleTimeout(game, winner) {
         try {
-            // Guard: re-check status to prevent duplicate termination from concurrent ticks
-            const freshGame = await Game.findById(game._id);
-            if (!freshGame || freshGame.status !== 'ongoing') return;
+            const now = Date.now();
+            const result = await Game.updateOne(
+                { _id: game._id, status: 'ongoing' },
+                {
+                    $set: {
+                        status: 'completed',
+                        result: winner,
+                        resultReason: 'timeout',
+                        updatedAt: now,
+                        queuedPremoves: { white: null, black: null }
+                    }
+                }
+            );
+
+            if (result.modifiedCount === 0) return;
 
             console.log(`⏱️  Timeout in game ${game._id}, winner: ${winner}`);
-
-            freshGame.status = 'completed';
-            freshGame.result = winner;
-            freshGame.resultReason = 'timeout';
-            freshGame.updatedAt = Date.now();
-            await freshGame.save();
-            await applyGameStats(freshGame._id);
+            await applyGameStats(game._id);
 
             // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {
@@ -151,23 +185,38 @@ class TimeoutChecker {
      */
     async handleDisconnectTimeout(game, winner) {
         try {
-            // Guard: re-check status to prevent duplicate termination from concurrent ticks
-            const freshGame = await Game.findById(game._id);
-            if (!freshGame || freshGame.status !== 'ongoing') return;
+            const now = Date.now();
 
-            console.log(`⏱️  Disconnect timeout in game ${game._id}, winner: ${winner}`);
+            // ATOMIC UPDATE: Only update if the game is still ongoing 
+            // AND the disconnectedPlayerId hasn't been cleared by a concurrent reconnect.
+            const result = await Game.updateOne(
+                {
+                    _id: game._id,
+                    status: 'ongoing',
+                    disconnectedPlayerId: game.disconnectedPlayerId
+                },
+                {
+                    $set: {
+                        status: 'completed',
+                        result: winner,
+                        resultReason: 'disconnect_timeout',
+                        disconnectedPlayerId: null,
+                        disconnectDeadlineAt: null,
+                        updatedAt: now,
+                        queuedPremoves: { white: null, black: null }, // Clean up premoves too
+                    }
+                }
+            );
 
-            freshGame.status = 'completed';
-            freshGame.result = winner;
-            freshGame.resultReason = 'disconnect_timeout';
+            // Guard: If modifiedCount is 0, another process (like a reconnect) beat us to it.
+            if (result.modifiedCount === 0) {
+                console.log(`⏱️  Disconnect timeout skipped for game ${game._id} (already handled or reconnected)`);
+                return;
+            }
 
-            // Clear pending disconnection fields
-            freshGame.disconnectedPlayerId = null;
-            freshGame.disconnectDeadlineAt = null;
+            console.log(`⏱️  Disconnect timeout applied in game ${game._id}, winner: ${winner}`);
 
-            freshGame.updatedAt = Date.now();
-            await freshGame.save();
-            await applyGameStats(freshGame._id);
+            await applyGameStats(game._id);
 
             // Notify players — aligned to GameOverPayload
             this.io.to(game._id.toString()).emit('game_over', {

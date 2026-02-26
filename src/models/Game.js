@@ -126,6 +126,19 @@ const gameSchema = new mongoose.Schema(
       enum: ['white', 'black', null],
       default: null,
     },
+    rematchOfferFrom: {
+      type: String,
+      enum: ['white', 'black', null],
+      default: null,
+    },
+    rematchDeclined: {
+      type: Boolean,
+      default: false,
+    },
+    nextGameId: {
+      type: String,
+      default: null,
+    },
   },
   {
     timestamps: true,

@@ -160,20 +160,52 @@ function setupSocket(server) {
                         // This user is fully disconnecting from this room
                         if (mongoose.Types.ObjectId.isValid(room)) {
                             try {
+                                // Extra guard for refresh races:
+                                // if user already has another connected socket (new tab/refresh),
+                                // do not mark as disconnected.
+                                const userSockets = await io.in(userId).fetchSockets();
+                                const hasAnotherConnectedSocket = userSockets.some(s => s.id !== socket.id);
+                                if (hasAnotherConnectedSocket) {
+                                    continue;
+                                }
+
                                 const game = await Game.findById(room);
                                 if (game && game.status === 'ongoing') {
                                     const isPlayer = game.whitePlayer.toString() === userId || game.blackPlayer.toString() === userId;
                                     if (isPlayer) {
+                                        // Extra check: only set disconnect marker if it isn't set yet
                                         const deadline = Date.now() + 20000; // 20 seconds grace period
-                                        game.disconnectedPlayerId = userId;
-                                        game.disconnectDeadlineAt = deadline;
-                                        await game.save();
 
-                                        socket.to(room).emit('opponent_disconnected', {
-                                            playerId: userId,
-                                            reconnectDeadlineAt: deadline
-                                        });
-                                        logger.info(`[Socket] User ${userId} disconnected from game ${room}, starting 20s grace period | Socket: ${socket.id}`);
+                                        // Atomic update to mark player as disconnected, only if no other player has been marked
+                                        // and the game is still ongoing.
+                                        const updateResult = await Game.updateOne(
+                                            {
+                                                _id: room,
+                                                status: 'ongoing',
+                                                // Either it's unset, or it's already this user (idempotent update)
+                                                $or: [
+                                                    { disconnectedPlayerId: null },
+                                                    { disconnectedPlayerId: userId }
+                                                ]
+                                            },
+                                            {
+                                                $set: {
+                                                    disconnectedPlayerId: userId,
+                                                    disconnectDeadlineAt: deadline
+                                                }
+                                            }
+                                        );
+
+                                        if (updateResult.modifiedCount > 0) {
+                                            socket.to(room).emit('opponent_disconnected', {
+                                                playerId: userId,
+                                                reconnectDeadlineAt: deadline,
+                                                gameId: room
+                                            });
+                                            logger.info(`[Socket] User ${userId} disconnected from game ${room}, starting 20s grace period | Socket: ${socket.id}`);
+                                        } else {
+                                            logger.info(`[Socket] Skipped marking user ${userId} disconnected from game ${room} (game not ongoing or already marked) | Socket: ${socket.id}`);
+                                        }
                                         continue;
                                     }
                                 }
@@ -184,7 +216,7 @@ function setupSocket(server) {
                     }
 
                     // Fallback or non-game room emit
-                    socket.to(room).emit('opponent_disconnected', { playerId: userId });
+                    socket.to(room).emit('opponent_disconnected', { playerId: userId, gameId: room });
                 }
             }
         });
