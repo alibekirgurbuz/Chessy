@@ -113,7 +113,11 @@ const gameSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
-    drawOffersCount: {
+    whiteDrawOffers: {
+      type: Number,
+      default: 0,
+    },
+    blackDrawOffers: {
       type: Number,
       default: 0,
     },

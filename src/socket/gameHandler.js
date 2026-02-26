@@ -766,9 +766,13 @@ function gameHandler(io, socket) {
                 return socket.emit('error', { message: 'Game is not active' });
             }
 
-            // Check limits (max 2 offers per game)
-            if (game.drawOffersCount >= 2) {
-                return socket.emit('error', { message: 'Maximum draw offers reached for this game' });
+            const playerColor = isWhitePlayer ? 'white' : 'black';
+            const opponentId = isWhitePlayer ? game.blackPlayer.toString() : game.whitePlayer.toString();
+
+            // Check limits (max 2 offers per player per game)
+            const currentOffers = playerColor === 'white' ? game.whiteDrawOffers : game.blackDrawOffers;
+            if (currentOffers >= 2) {
+                return socket.emit('error', { message: 'Maximum draw offers reached for you in this game' });
             }
 
             // Check if there is already a pending offer
@@ -776,12 +780,13 @@ function gameHandler(io, socket) {
                 return socket.emit('error', { message: 'A draw offer is already pending' });
             }
 
-            const playerColor = isWhitePlayer ? 'white' : 'black';
-            const opponentId = isWhitePlayer ? game.blackPlayer.toString() : game.whitePlayer.toString();
-
             // Update state
             game.pendingDrawOfferFrom = playerColor;
-            game.drawOffersCount += 1;
+            if (playerColor === 'white') {
+                game.whiteDrawOffers += 1;
+            } else {
+                game.blackDrawOffers += 1;
+            }
             await game.save();
 
             // Send to opponent
