@@ -7,21 +7,20 @@ class PremoveManager {
     }
 
     /**
-     * Set a premove for a player color.
+     * Set a premove for a player color (intent log only — actual persistence is in Handler).
      */
     setPremove(gameId, color, premove) {
-        // We rely on the Game model storage for persistence, 
-        // but we can also use Redis for a "hot" cache if needed.
-        // For now, simplicity: just a placeholder as Handler updates DB.
         logger.debug(`📋 [PremoveManager] premove_set_intent`, { gameId, player: color });
     }
 
     /**
-     * Get the queued premove from the game object (which is the source of truth).
+     * Get the *first* queued premove (queue index 0) for a player color.
      */
     getPremove(game, color) {
         if (!game || !game.queuedPremoves) return null;
-        const p = game.queuedPremoves[color];
+        const queue = game.queuedPremoves[color];
+        if (!Array.isArray(queue) || queue.length === 0) return null;
+        const p = queue[0];
         if (!p || !p.from || !p.to) return null;
         return {
             from: p.from,
@@ -33,12 +32,28 @@ class PremoveManager {
         };
     }
 
+    /**
+     * Get the full queue array (up to 2 items) for a player color.
+     */
+    getQueue(game, color) {
+        if (!game || !game.queuedPremoves) return [];
+        const queue = game.queuedPremoves[color];
+        return Array.isArray(queue) ? queue : [];
+    }
+
     hasPremove(game, color) {
         return this.getPremove(game, color) !== null;
     }
 
+    /**
+     * Returns true if the queue is full (max 2 items).
+     */
+    isQueueFull(game, color) {
+        return this.getQueue(game, color).length >= 2;
+    }
+
     clearPremove(gameId, color, reason = 'unknown') {
-        logger.debug(`🧹 [PremoveManager] premove_cleared_intent`, { gameId, player: color, reason });
+        logger.debug(`🧹 [PremoveManager] premove_shifted_intent`, { gameId, player: color, reason });
     }
 
     clearAll(gameId, reason = 'unknown') {

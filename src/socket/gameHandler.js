@@ -15,278 +15,165 @@ function gameHandler(io, socket) {
         return null;
     }
 
-    // ——— Helper: execute a premove from the queue (called inside the lock) ———
-    async function tryExecuteQueuedPremove(game, chess, gameId) {
-        // Determine whose turn it is now (after the normal move)
-        const turnChar = chess.turn(); // 'w' or 'b'
-        const premoveColor = turnChar === 'w' ? 'white' : 'black';
+    // ——— Helper: execute all valid queued premoves sequentially (called inside the lock) ———
+    // Returns the final game status variables so the caller can broadcast them
+    async function processPremovesUntilEmpty(game, chess, gameId, previousTraceId = null) {
+        let anyExecuted = false;
 
-        // ── TRACE: turn_flipped ──
-        const trace = PremoveTracer.start(gameId, premoveColor, chess.history().length);
-        trace.mark('turn_flipped');
+        // We might loop up to 2 times (one for each player's premove)
+        while (true) {
+            if (game.status === 'completed' || chess.isGameOver()) break;
 
-        const queuedPremove = premoveManager.getPremove(game, premoveColor);
-        logger.debug('[PREMOVE_DIAG] execute_premove_lookup', {
-            gameId, premoveColor, hasQueuedPremove: !!queuedPremove,
-            setAt: queuedPremove ? queuedPremove.setAt : null,
-            sourceMoveNo: queuedPremove ? queuedPremove.sourceMoveNo : null
-        });
-        if (!queuedPremove) return;
+            const turnChar = chess.turn(); // 'w' or 'b'
+            const premoveColor = turnChar === 'w' ? 'white' : 'black';
+            const queuedPremove = premoveManager.getPremove(game, premoveColor);
 
-        const traceId = queuedPremove.traceId;
+            if (!queuedPremove) break; // No premove for current player
 
-        // ── TRACE: queued_premove_found ──
-        trace.mark('queued_premove_found', {
-            from: queuedPremove.from,
-            to: queuedPremove.to,
-            promotion: queuedPremove.promotion || null
-        });
-
-        // Capture clock before premove
-        let clockBefore = null;
-        if (game.clock) {
-            const tmpClock = ClockManager.fromJSON(game.clock);
-            const st = tmpClock.getState();
-            clockBefore = premoveColor === 'white' ? st.whiteTime : st.blackTime;
-        }
-
-        // ── TRACE: premove_execute_start ──
-        trace.mark('premove_execute_start');
-
-        try {
-            const moveResult = chess.move({
+            const traceId = queuedPremove.traceId || previousTraceId;
+            const trace = PremoveTracer.start(gameId, premoveColor, chess.history().length);
+            trace.mark('turn_flipped');
+            trace.mark('queued_premove_found', {
                 from: queuedPremove.from,
                 to: queuedPremove.to,
-                promotion: queuedPremove.promotion || 'q'
+                promotion: queuedPremove.promotion || null
             });
 
-            if (!moveResult) {
-                throw new Error('Invalid premove');
-            }
-
-            // ===== CLOCK for premove =====
-            let clockState = null;
-            let clockAfter = null;
+            // Capture clock before
+            let clockBefore = null;
             if (game.clock) {
-                const clock = ClockManager.fromJSON(game.clock);
-                const playerClockColor = turnChar; // 'w' or 'b'
-
-                try {
-                    clockState = clock.makeMove(playerClockColor, Date.now());
-
-                    if (clockState.timeout) {
-                        const updatedClock = clock.toJSON();
-                        const updatedPgn = chess.pgn();
-                        const now = Date.now();
-
-                        premoveManager.clearPremove(gameId, premoveColor, 'executed_timeout');
-
-                        // ── Broadcast-first (timeout) ──
-                        io.to(gameId).emit('game_over', {
-                            gameId,
-                            result: clockState.winner,
-                            reason: 'timeout'
-                        });
-                        io.to(gameId).emit('clock_update', clockState);
-
-                        // ── Narrow DB persist (timeout) ──
-                        trace.mark('premove_db_persist_start');
-                        await Game.updateOne({ _id: gameId }, {
-                            $set: {
-                                status: 'completed',
-                                result: clockState.winner,
-                                clock: updatedClock,
-                                pgn: updatedPgn,
-                                updatedAt: now,
-                                queuedPremoves: { white: null, black: null },
-                            }
-                        });
-                        trace.mark('premove_db_persist_end');
-
-                        premoveManager.clearAll(gameId, 'game_over');
-                        applyGameStats(gameId);
-
-                        trace.mark('premove_execute_end', { outcome: 'timeout' });
-                        trace.summary();
-                        return;
-                    }
-
-                    game.clock = clock.toJSON();
-                    clockAfter = premoveColor === 'white' ? clockState.whiteTime : clockState.blackTime;
-                } catch (clockError) {
-                    console.error('Premove clock error:', clockError);
-                    premoveManager.clearPremove(gameId, premoveColor, 'clock_error');
-
-                    // ── Broadcast-first (clock error) ──
-                    const premovePlayerId = premoveColor === 'white'
-                        ? game.whitePlayer.toString()
-                        : game.blackPlayer.toString();
-                    io.to(premovePlayerId).emit('premove_rejected', {
-                        gameId,
-                        reason: clockError.message,
-                        traceId
-                    });
-                    io.to(gameId).emit('premove_cleared', {
-                        gameId,
-                        by: premoveColor,
-                        reason: 'rejected',
-                        traceId
-                    });
-
-                    if (traceId) Telemetry.log({ traceId, gameId, userId: premovePlayerId, event: 'premove_rejected' });
-
-                    // ── Narrow DB persist (clock error) ──
-                    await Game.updateOne({ _id: gameId }, {
-                        $set: {
-                            [`queuedPremoves.${premoveColor}`]: null,
-                        }
-                    });
-
-                    trace.mark('premove_rejected', { reason: clockError.message });
-                    trace.summary();
-                    return;
-                }
-            }
-            // ===== END CLOCK =====
-
-            // ── TRACE: premove_execute_end ──
-            trace.mark('premove_execute_end', {
-                move: moveResult.san,
-                clock_before_ms: clockBefore,
-                clock_after_ms: clockAfter,
-                clock_delta_ms: (clockBefore != null && clockAfter != null) ? clockBefore - clockAfter : null
-            });
-
-            // Compute updated state (in-memory)
-            const updatedPgn = chess.pgn();
-            const now = Date.now();
-            let updatedStatus = game.status;
-            let updatedResult = game.result;
-            let updatedResultReason = game.resultReason;
-
-            // Check game over after premove
-            if (chess.isGameOver()) {
-                updatedStatus = 'completed';
-                if (chess.isCheckmate()) {
-                    updatedResult = chess.turn() === 'w' ? 'black' : 'white';
-                    updatedResultReason = 'checkmate';
-                } else if (chess.isDraw()) {
-                    updatedResult = 'draw';
-                    updatedResultReason = chess.isStalemate() ? 'stalemate' : 'draw';
-                }
+                const tmpClock = ClockManager.fromJSON(game.clock);
+                const st = tmpClock.getState();
+                clockBefore = premoveColor === 'white' ? st.whiteTime : st.blackTime;
             }
 
-            // Clear the executed premove (in-memory)
-            premoveManager.clearPremove(gameId, premoveColor, 'executed');
-
-            // ── Broadcast-first: emit before DB persist ──
-            trace.mark('premove_broadcast_start');
-
-            io.to(gameId).emit('move_made', {
-                gameId,
-                move: moveResult.san,
-                from: moveResult.from,
-                to: moveResult.to,
-                pgn: updatedPgn,
-                currentTurn: chess.turn(),
-                fen: chess.fen(),
-                moveCount: chess.history().length,
-                traceId
-            });
-
-            if (traceId) {
-                Telemetry.log({ traceId, gameId, event: 'premove_executed' });
-            }
-
-            // ── TRACE: move_broadcast_sent ──
-            trace.mark('move_broadcast_sent');
-
-            if (clockState) {
-                io.to(gameId).emit('clock_update', { ...clockState, traceId });
-                trace.mark('clock_update_sent');
-            }
-
-            io.to(gameId).emit('premove_cleared', {
-                gameId,
-                by: premoveColor,
-                reason: 'executed',
-                traceId
-            });
-
-            if (updatedStatus === 'completed') {
-                io.to(gameId).emit('game_over', {
-                    gameId,
-                    result: updatedResult,
-                    reason: chess.isCheckmate() ? 'checkmate' : 'draw'
+            trace.mark('premove_execute_start');
+            try {
+                const moveResult = chess.move({
+                    from: queuedPremove.from,
+                    to: queuedPremove.to,
+                    promotion: queuedPremove.promotion || 'q'
                 });
-                premoveManager.clearAll(gameId, 'game_over');
-                applyGameStats(gameId);
-            }
 
-            trace.mark('premove_broadcast_end');
+                if (!moveResult) throw new Error('Invalid premove');
 
-            // ── Narrow DB persist (happy path) ──
-            trace.mark('premove_db_persist_start');
+                // Clock logic
+                let clockState = null;
+                let clockAfter = null;
+                if (game.clock) {
+                    const clock = ClockManager.fromJSON(game.clock);
+                    try {
+                        clockState = clock.makeMove(turnChar, Date.now());
+                        if (clockState.timeout) {
+                            game.status = 'completed';
+                            game.result = clockState.winner;
+                            game.resultReason = 'timeout';
+                            game.clock = clock.toJSON();
+                            premoveManager.clearPremove(gameId, premoveColor, 'executed_timeout');
 
-            const dbUpdate = {
-                pgn: updatedPgn,
-                updatedAt: now,
-                [`queuedPremoves.${premoveColor}`]: null,
-            };
-            if (game.clock) dbUpdate.clock = game.clock;
-            if (updatedStatus === 'completed') {
-                dbUpdate.status = updatedStatus;
-                dbUpdate.result = updatedResult;
-                dbUpdate.resultReason = updatedResultReason;
-            }
-            await Game.updateOne({ _id: gameId }, { $set: dbUpdate });
+                            trace.mark('premove_execute_end', { outcome: 'timeout' });
+                            trace.summary();
+                            break; // Stop loop, game over
+                        }
+                        game.clock = clock.toJSON();
+                        clockAfter = premoveColor === 'white' ? clockState.whiteTime : clockState.blackTime;
+                    } catch (clockError) {
+                        premoveManager.clearPremove(gameId, premoveColor, 'clock_error');
+                        // In-memory shift first item from queue
+                        if (game.queuedPremoves && Array.isArray(game.queuedPremoves[premoveColor])) {
+                            game.queuedPremoves[premoveColor].shift();
+                        }
 
-            trace.mark('premove_db_persist_end');
+                        // Send fast-rejection
+                        const premovePlayerId = premoveColor === 'white' ? game.whitePlayer.toString() : game.blackPlayer.toString();
+                        io.to(premovePlayerId).emit('premove_rejected', { gameId, reason: clockError.message, traceId });
+                        io.to(gameId).emit('premove_cleared', { gameId, by: premoveColor, reason: 'rejected', traceId });
 
-            // ── TRACE: summary ──
-            trace.summary();
-
-        } catch (e) {
-            // Premove is invalid
-            premoveManager.clearPremove(gameId, premoveColor, 'rejected');
-
-            // ── TRACE: premove_rejected ──
-            trace.mark('premove_rejected', {
-                from: queuedPremove.from,
-                to: queuedPremove.to,
-                reason: e.message
-            });
-
-            // ── Broadcast-first (rejected) ──
-            const premovePlayerId = premoveColor === 'white'
-                ? game.whitePlayer.toString()
-                : game.blackPlayer.toString();
-            io.to(premovePlayerId).emit('premove_rejected', {
-                gameId,
-                reason: e.message || 'Invalid premove',
-                traceId
-            });
-
-            io.to(gameId).emit('premove_cleared', {
-                gameId,
-                by: premoveColor,
-                reason: 'rejected',
-                traceId
-            });
-
-            if (traceId) {
-                Telemetry.log({ traceId, gameId, userId: premovePlayerId, event: 'premove_rejected' });
-            }
-
-            // ── Narrow DB persist (rejected) ──
-            await Game.updateOne({ _id: gameId }, {
-                $set: {
-                    [`queuedPremoves.${premoveColor}`]: null,
+                        trace.mark('premove_rejected', { reason: clockError.message });
+                        trace.summary();
+                        break; // Stop loop, invalid
+                    }
                 }
-            });
 
-            trace.summary();
+                trace.mark('premove_execute_end', {
+                    move: moveResult.san,
+                    clock_before_ms: clockBefore,
+                    clock_after_ms: clockAfter
+                });
+
+                // Update game state
+                game.pgn = chess.pgn();
+                game.updatedAt = Date.now();
+                if (chess.isGameOver()) {
+                    game.status = 'completed';
+                    if (chess.isCheckmate()) {
+                        game.result = chess.turn() === 'w' ? 'black' : 'white';
+                        game.resultReason = 'checkmate';
+                    } else if (chess.isDraw()) {
+                        game.result = 'draw';
+                        game.resultReason = chess.isStalemate() ? 'stalemate' : 'draw';
+                    }
+                }
+
+                // In-memory shift: remove the first premove from queue (it was just executed)
+                premoveManager.clearPremove(gameId, premoveColor, 'executed');
+                if (game.queuedPremoves && Array.isArray(game.queuedPremoves[premoveColor])) {
+                    game.queuedPremoves[premoveColor].shift();
+                }
+                anyExecuted = true;
+
+                // Fire broadcasrts immediately for this hop
+                trace.mark('premove_broadcast_start');
+                io.to(gameId).emit('move_made', {
+                    gameId,
+                    move: moveResult.san,
+                    from: moveResult.from,
+                    to: moveResult.to,
+                    pgn: game.pgn,
+                    currentTurn: chess.turn(),
+                    fen: chess.fen(),
+                    moveCount: chess.history().length,
+                    traceId
+                });
+
+                if (clockState) {
+                    io.to(gameId).emit('clock_update', { ...clockState, traceId });
+                }
+
+                io.to(gameId).emit('premove_cleared', { gameId, by: premoveColor, reason: 'executed', traceId });
+
+                if (game.status === 'completed') {
+                    io.to(gameId).emit('game_over', {
+                        gameId,
+                        result: game.result,
+                        reason: game.resultReason
+                    });
+                    premoveManager.clearAll(gameId, 'game_over');
+                    applyGameStats(gameId);
+                }
+
+                trace.mark('premove_broadcast_end');
+                trace.summary();
+
+                // Wait a tiny bit (optional) or continue loop seamlessly
+            } catch (e) {
+                // Invalid or failed premove — clear the entire queue for that color
+                premoveManager.clearPremove(gameId, premoveColor, 'rejected');
+                if (game.queuedPremoves && Array.isArray(game.queuedPremoves[premoveColor])) {
+                    game.queuedPremoves[premoveColor] = [];
+                }
+
+                const premovePlayerId = premoveColor === 'white' ? game.whitePlayer.toString() : game.blackPlayer.toString();
+                io.to(premovePlayerId).emit('premove_rejected', { gameId, reason: e.message || 'Invalid premove', traceId });
+                io.to(gameId).emit('premove_cleared', { gameId, by: premoveColor, reason: 'rejected', traceId });
+
+                trace.mark('premove_rejected', { reason: e.message });
+                trace.summary();
+                break;
+            }
         }
+
+        return anyExecuted;
     }
 
 
@@ -625,7 +512,7 @@ function gameHandler(io, socket) {
                         }
                     }
 
-                    // Prepare DB Payload (Make sure we use lean object)
+                    // Prepare DB Payload for the normal move
                     moveDbUpdate = {
                         pgn: updatedPgn,
                         updatedAt,
@@ -633,6 +520,8 @@ function gameHandler(io, socket) {
                     if (game.clock) moveDbUpdate.clock = game.clock;
                     if (moverColor && premoveManager.getPremove(game, moverColor) === null) {
                         moveDbUpdate[`queuedPremoves.${moverColor}`] = null;
+                        if (!game.queuedPremoves) game.queuedPremoves = {};
+                        game.queuedPremoves[moverColor] = null;
                     }
                     if (isGameOver) {
                         moveDbUpdate.status = game.status;
@@ -640,7 +529,31 @@ function gameHandler(io, socket) {
                         moveDbUpdate.resultReason = game.resultReason;
                     }
 
-                    // Save refs for background execution
+                    // Process cascaded premoves modifying the game object in memory
+                    if (!isGameOver) {
+                        await processPremovesUntilEmpty(game, chess, gameId, traceId);
+
+                        // Overwrite moveDbUpdate with the final aggregated state from all premoves
+                        moveDbUpdate.pgn = game.pgn;
+                        moveDbUpdate.updatedAt = game.updatedAt;
+                        if (game.clock) moveDbUpdate.clock = game.clock;
+                        if (game.status === 'completed') {
+                            isGameOver = true;
+                            moveDbUpdate.status = game.status;
+                            moveDbUpdate.result = game.result;
+                            moveDbUpdate.resultReason = game.resultReason;
+                        }
+
+                        // Mirror the updated premove queues (arrays)
+                        moveDbUpdate['queuedPremoves.white'] = Array.isArray(game.queuedPremoves?.white)
+                            ? game.queuedPremoves.white
+                            : [];
+                        moveDbUpdate['queuedPremoves.black'] = Array.isArray(game.queuedPremoves?.black)
+                            ? game.queuedPremoves.black
+                            : [];
+                    }
+
+                    // Save refs for background broadcast (of the primary move only, premove broadcast handled locally)
                     moveResultSan = moveResult.san;
                     moveResultFrom = moveResult.from;
                     moveResultTo = moveResult.to;
@@ -650,6 +563,13 @@ function gameHandler(io, socket) {
                     gameRef = game;
                     chessRef = chess;
 
+                    // PERSIST TO DB SYNCHRONOUSLY INSIDE THE LOCK 
+                    // This is the core fix to prevent set_premove concurrency overwrite
+                    if (traceId) Telemetry.log({ traceId, gameId, event: 'make_move_persist_start' });
+                    const persistStart = Date.now();
+                    await Game.updateOne({ _id: gameId }, { $set: moveDbUpdate });
+                    if (traceId) Telemetry.log({ traceId, gameId, event: 'make_move_persist_end', latencyMs: Date.now() - persistStart });
+
                 } catch (error) {
                     console.error('make_move inside-lock error:', error);
                     socket.emit('error', { message: error.message });
@@ -657,9 +577,9 @@ function gameHandler(io, socket) {
             });
             if (traceId) Telemetry.log({ traceId, gameId, event: 'lock_released', meta: { lock_hold_ms: Date.now() - lockStart } });
 
-            // ── OUTSIDE LOCK: Broadcast & Persist ──
+            // ── OUTSIDE LOCK: Broadcast Primary Move ──
             if (moveDbUpdate && gameRef) {
-                // Background Broadcast
+                // Background Broadcast (primary move)
                 io.to(gameId).emit('move_made', {
                     gameId,
                     move: moveResultSan,
@@ -679,34 +599,15 @@ function gameHandler(io, socket) {
 
                 if (traceId) Telemetry.log({ traceId, gameId, userId: socket.userId, event: 'make_move_broadcast' });
 
-                if (isGameOver) {
+                if (isGameOver && gameRef.status === 'completed') {
                     io.to(gameId).emit('game_over', {
                         gameId,
                         result: gameRef.result,
-                        // Fix: Ensure reason is emitted correctly for checkmate, timeout, etc.
                         reason: gameRef.resultReason || 'checkmate'
                     });
                     premoveManager.clearAll(gameId, 'game_over');
                     applyGameStats(gameId).catch(err => logger.error('applyGameStats err:', err));
                 }
-
-                // Background DB Persist + Premove Auto-Execute
-                setImmediate(async () => {
-                    try {
-                        if (traceId) Telemetry.log({ traceId, gameId, event: 'make_move_persist_start' });
-                        const persistStart = Date.now();
-                        await Game.updateOne({ _id: gameId }, { $set: moveDbUpdate });
-                        if (traceId) Telemetry.log({ traceId, gameId, event: 'make_move_persist_end', latencyMs: Date.now() - persistStart });
-
-                        // If game is not over, try to execute the opponent's queued premove
-                        if (!isGameOver) {
-                            await tryExecuteQueuedPremove(gameRef, chessRef, gameId);
-                        }
-                    } catch (err) {
-                        logger.error('Failed to async persist move to DB:', err);
-                        io.to(socket.id).emit('error', { message: 'Sync error: Failed to persist move' });
-                    }
-                });
             }
 
         } catch (error) {
@@ -782,15 +683,12 @@ function gameHandler(io, socket) {
                     }
                     const currentTurnColor = chess.turn() === 'w' ? 'white' : 'black';
                     logger.debug('[PREMOVE_DIAG] set_premove_turn_check', { gameId, playerColor, currentTurnColor, isPlayersTurn: currentTurnColor === playerColor });
+
+                    let lateAcceptance = false;
                     if (currentTurnColor === playerColor) {
-                        logger.debug('[PREMOVE_DIAG] set_premove_rejected_diag', { gameId, playerColor, reason: 'It is your turn' });
-                        return socket.emit('premove_rejected', {
-                            gameId,
-                            reason: 'It is your turn — make a normal move'
-                        });
+                        logger.debug('[PREMOVE_DIAG] set_premove_late_acceptance', { gameId, playerColor });
+                        lateAcceptance = true;
                     }
-
-
 
                     // Store premove (overwrites any existing) - Memory Only inside lock
                     const setAt = Date.now();
@@ -809,8 +707,66 @@ function gameHandler(io, socket) {
 
                     premoveManager.setPremove(gameId, playerColor, queuedData);
 
+                    // Attach to game object in memory for DB persist AND cascade read
+                    // Push to array queue (max 2 slots); reject if already full
+                    if (!game.queuedPremoves) game.queuedPremoves = {};
+                    if (!Array.isArray(game.queuedPremoves[playerColor])) {
+                        game.queuedPremoves[playerColor] = [];
+                    }
+
+                    if (game.queuedPremoves[playerColor].length >= 2) {
+                        // Queue full — reject silently (client can show no-op feedback)
+                        logger.debug('[PREMOVE_DIAG] set_premove_queue_full', { gameId, playerColor });
+                        return socket.emit('premove_rejected', {
+                            gameId,
+                            reason: 'Premove queue is full (max 2)',
+                            traceId
+                        });
+                    }
+
+                    game.queuedPremoves[playerColor].push(queuedData);
+
                     dbPersistData = queuedData;
                     playerColorRef = playerColor;
+
+                    if (lateAcceptance) {
+                        // The user's turn actually arrived before or exactly as the packet hit the lock.
+                        // We will consume it right here via cascade processing inside the same lock!
+                        await processPremovesUntilEmpty(game, chess, gameId, traceId);
+                    }
+
+                    // SYNCHRONOUS DB PERSIST INSIDE THE LOCK
+                    if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_start' });
+                    const persistStart = Date.now();
+
+                    // Only update the queuedPremoves field, unless lateAcceptance executed it 
+                    // which modifies PGN, Clock, Status etc.
+                    const updatePayload = {};
+                    if (lateAcceptance) {
+                        updatePayload.pgn = game.pgn;
+                        updatePayload.updatedAt = game.updatedAt;
+                        if (game.clock) updatePayload.clock = game.clock;
+                        if (game.status === 'completed') {
+                            updatePayload.status = game.status;
+                            updatePayload.result = game.result;
+                            updatePayload.resultReason = game.resultReason;
+                        }
+                        updatePayload['queuedPremoves.white'] = Array.isArray(game.queuedPremoves?.white)
+                            ? game.queuedPremoves.white
+                            : [];
+                        updatePayload['queuedPremoves.black'] = Array.isArray(game.queuedPremoves?.black)
+                            ? game.queuedPremoves.black
+                            : [];
+                    } else {
+                        // Push newly queued premove at correct array index in DB
+                        updatePayload[`queuedPremoves.${playerColor}`] = game.queuedPremoves[playerColor];
+                    }
+
+                    await Game.updateOne(
+                        { _id: gameId },
+                        { $set: updatePayload }
+                    );
+                    if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_end', latencyMs: Date.now() - persistStart });
 
                 } catch (error) {
                     console.error('set_premove error:', error);
@@ -819,32 +775,13 @@ function gameHandler(io, socket) {
             });
             if (traceId) Telemetry.log({ traceId, gameId, event: 'lock_released', meta: { lock_hold_ms: Date.now() - lockStart } });
 
-            // ── OUTSIDE LOCK: Broadcast & Persist ──
+            // ── OUTSIDE LOCK: Broadcast Initial Queue Setup ──
             if (dbPersistData && playerColorRef) {
-                // Background Broadcast
                 io.to(gameId).emit('premove_set', {
                     gameId,
                     by: playerColorRef,
                     premove: { from: premove.from, to: premove.to, promotion: premove.promotion },
                     traceId
-                });
-
-                // Background DB Persist
-                setImmediate(async () => {
-                    try {
-                        if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_start' });
-                        const persistStart = Date.now();
-                        await Game.updateOne(
-                            { _id: gameId },
-                            { $set: { [`queuedPremoves.${playerColorRef}`]: dbPersistData } }
-                        );
-                        if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_end', latencyMs: Date.now() - persistStart });
-                    } catch (err) {
-                        logger.error('Failed to async persist queued premove to DB:', err);
-                        if (traceId) Telemetry.log({ traceId, gameId, event: 'set_premove_persist_error', meta: { error: err.message } });
-                        // Let client know that sync failed
-                        io.to(socket.id).emit('error', { message: 'Sync error: Failed to persist premove.' });
-                    }
                 });
             }
         } catch (error) {
@@ -869,14 +806,14 @@ function gameHandler(io, socket) {
                         return socket.emit('error', { message: 'You are not in this game' });
                     }
 
-                    // Clear premove
+                    // Clear entire premove queue for this player
                     premoveManager.clearPremove(gameId, playerColor, 'cancelled');
 
-                    // Persist
-                    if (game.queuedPremoves) {
-                        game.queuedPremoves[playerColor] = null;
-                        await game.save();
-                    }
+                    // Persist: set queue to empty array
+                    await Game.updateOne(
+                        { _id: gameId },
+                        { $set: { [`queuedPremoves.${playerColor}`]: [] } }
+                    );
 
                     // Notify room and user
                     io.to(gameId).emit('premove_cleared', { gameId, by: playerColor, reason: 'cancelled' });

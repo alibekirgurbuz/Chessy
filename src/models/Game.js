@@ -94,18 +94,30 @@ const gameSchema = new mongoose.Schema(
     },
     queuedPremoves: {
       white: {
-        from: { type: String, default: null },
-        to: { type: String, default: null },
-        promotion: { type: String, default: null },
-        setAt: { type: Number, default: null },
-        sourceMoveNo: { type: Number, default: null },
+        type: [
+          {
+            from: { type: String },
+            to: { type: String },
+            promotion: { type: String, default: null },
+            setAt: { type: Number },
+            sourceMoveNo: { type: Number },
+            traceId: { type: String, default: null },
+          }
+        ],
+        default: [],
       },
       black: {
-        from: { type: String, default: null },
-        to: { type: String, default: null },
-        promotion: { type: String, default: null },
-        setAt: { type: Number, default: null },
-        sourceMoveNo: { type: Number, default: null },
+        type: [
+          {
+            from: { type: String },
+            to: { type: String },
+            promotion: { type: String, default: null },
+            setAt: { type: Number },
+            sourceMoveNo: { type: Number },
+            traceId: { type: String, default: null },
+          }
+        ],
+        default: [],
       },
     },
     // Idempotency flag: true after User.wins/losses/draws have been updated
